@@ -1,25 +1,35 @@
 import argparse
 import os
 
-import torch
-import torch.nn as nn
-
-# import the skrl components to build the RL system
+# IMPORTANT: delay importing torch/skrl heavy modules until after SimulationApp
+# is created (via load_isaaclab_env). This avoids GLIBCXX/libstdc++ conflicts
+# by letting Isaac Sim's runtime be loaded first.
 from skrl import logger
-from skrl.agents.torch.sac import SAC, SAC_CFG
 from skrl.envs.loaders.torch import load_isaaclab_env
-from skrl.envs.wrappers.torch import wrap_env
-from skrl.memories.torch import RandomMemory
-from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
-from skrl.resources.preprocessors.torch import RunningStandardScaler
-from skrl.trainers.torch import SequentialTrainer
-from skrl.utils import set_seed
 
 
 # parse arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", type=str, default=None, help="Load checkpoint from path")
 parser.add_argument("--eval", action="store_true", help="Run in evaluation mode (logging/checkpointing disabled)")
+
+
+
+# load the environment FIRST so that SimulationApp initializes and resolves
+# runtime libraries before importing torch/skrl heavy modules.
+task_name = "Isaac-Ant-Direct-v0"
+env = load_isaaclab_env(task_name=task_name, parser=parser, num_envs=64)
+
+# Now import torch/skrl heavy modules safely after SimulationApp is alive
+import torch
+import torch.nn as nn
+from skrl.envs.wrappers.torch import wrap_env
+from skrl.memories.torch import RandomMemory
+from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
+from skrl.agents.torch.sac import SAC, SAC_CFG
+from skrl.resources.preprocessors.torch import RunningStandardScaler
+from skrl.trainers.torch import SequentialTrainer
+from skrl.utils import set_seed
 
 
 # define models (stochastic and deterministic models) using mixins
@@ -89,12 +99,8 @@ class Critic(DeterministicMixin, Model):
         return self.net(torch.cat([inputs["observations"], inputs["taken_actions"]], dim=1)), {}
 
 
-# load the environment
-task_name = "Isaac-Ant-Direct-v0"
-env = load_isaaclab_env(task_name=task_name, parser=parser, num_envs=64)
 # wrap the environment
 env = wrap_env(env)
-
 device = env.device
 
 
