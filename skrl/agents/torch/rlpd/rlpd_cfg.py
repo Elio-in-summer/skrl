@@ -114,6 +114,13 @@ class RLPD_CFG(AgentCfg):
     mixed_precision: bool = False
     """Whether to enable automatic mixed precision for higher performance."""
 
+    # RLPD-specific model hints (read by examples when building networks)
+    critic_layer_norm: bool = False
+    """Enable LayerNorm on critic hidden layers (final scalar head stays without LN)."""
+
+    layer_norm_affine: bool = True
+    """Whether LayerNorm uses learnable affine parameters (gamma/beta). Defaults to True (matches Flax/Linen)."""
+
     def expand(self) -> None:
         """Expand the configuration (mirrors SAC_CFG.expand)."""
         super().expand()
@@ -136,4 +143,3 @@ class RLPD_CFG(AgentCfg):
                 self.learning_rate_scheduler_kwargs,
                 self.learning_rate_scheduler_kwargs,
             )
-

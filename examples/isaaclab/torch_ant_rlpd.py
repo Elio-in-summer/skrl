@@ -17,6 +17,10 @@ parser.add_argument("--no_pbar", action="store_true", help="Disable progress bar
 parser.add_argument("--gradient_steps", type=int, default=1, help="Number of gradient steps per env step")
 parser.add_argument("--batch_size", type=int, default=4096, help="Batch size for updates")
 parser.add_argument("--learning_rate", type=float, default=5e-4, help="Learning rate for the actor and critic networks")
+parser.add_argument("--critic_layer_norm", action="store_true", help="Enable LayerNorm on critic hidden layers")
+parser.add_argument("--ln_affine", dest="ln_affine", action="store_true", help="LayerNorm with learnable affine (gamma/beta)")
+parser.add_argument("--no_ln_affine", dest="ln_affine", action="store_false", help="LayerNorm without learnable affine")
+parser.set_defaults(ln_affine=True)
 
 # load the environment FIRST so that SimulationApp initializes and resolves
 # runtime libraries before importing torch/skrl heavy modules.
@@ -29,6 +33,7 @@ import torch.nn as nn
 from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory
 from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
+from skrl.models.torch.mlp_ln import RLPDStateActionCritic
 from skrl.agents.torch.rlpd import RLPD, RLPD_CFG
 from skrl.resources.preprocessors.torch import RunningStandardScaler
 from skrl.trainers.torch import SequentialTrainer
@@ -119,13 +124,23 @@ set_seed(args.seed)  # e.g. `set_seed(42)` for fixed seed
 memory = RandomMemory(memory_size=16000, num_envs=env.num_envs, device=device)
 
 
-# instantiate the agent's models (function approximators).
+# instantiate the agent's models (function approximators)
 models = {}
 models["policy"] = StochasticActor(env.observation_space, env.state_space, env.action_space, device)
-models["critic_1"] = Critic(env.observation_space, env.state_space, env.action_space, device)
-models["critic_2"] = Critic(env.observation_space, env.state_space, env.action_space, device)
-models["target_critic_1"] = Critic(env.observation_space, env.state_space, env.action_space, device)
-models["target_critic_2"] = Critic(env.observation_space, env.state_space, env.action_space, device)
+
+# choose critic implementation
+if args.critic_layer_norm:
+    critic_cls = lambda: RLPDStateActionCritic(  # noqa: E731
+        env.observation_space, env.state_space, env.action_space, device,
+        hidden_dims=(512, 256), activation=nn.ReLU, layer_norm_affine=args.ln_affine,
+    )
+else:
+    critic_cls = lambda: Critic(env.observation_space, env.state_space, env.action_space, device)  # noqa: E731
+
+models["critic_1"] = critic_cls()
+models["critic_2"] = critic_cls()
+models["target_critic_1"] = critic_cls()
+models["target_critic_2"] = critic_cls()
 
 
 # configure and instantiate the agent (visit其文档查看所有参数)
@@ -139,11 +154,16 @@ cfg.random_timesteps = 50
 cfg.learning_starts = 50
 cfg.learn_entropy = True
 cfg.initial_entropy_value = 1.0
+cfg.critic_layer_norm = args.critic_layer_norm
+cfg.layer_norm_affine = args.ln_affine
 cfg.state_preprocessor = RunningStandardScaler
 cfg.state_preprocessor_kwargs = {"size": env.observation_space, "device": device}
 # logging to TensorBoard and write checkpoints (in timesteps)
 cfg.experiment.write_interval = "auto" if not args.eval else 0
 cfg.experiment.checkpoint_interval = "auto" if not args.eval else 0
+suffix = ""
+if args.critic_layer_norm:
+    suffix = "_LN" if args.ln_affine else "_LN_noaff"
 cfg.experiment.directory = f"runs/torch/{task_name}"
 
 agent = RLPD(
