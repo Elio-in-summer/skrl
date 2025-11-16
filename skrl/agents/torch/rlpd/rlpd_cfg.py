@@ -121,6 +121,16 @@ class RLPD_CFG(AgentCfg):
     layer_norm_affine: bool = True
     """Whether LayerNorm uses learnable affine parameters (gamma/beta). Defaults to True (matches Flax/Linen)."""
 
+    # Ensemble and update-to-data controls (RLPD / REDQ style)
+    num_qs: int = 5
+    """Number of critic networks in the ensemble (E)."""
+
+    num_min_qs: int | None = 2
+    """Number of target critics to subsample for min aggregation (M). If None, use ``num_qs``."""
+
+    utd_ratio: int = 1
+    """Update-to-data ratio (slice a large batch into this many mini-batches; update critics UTD times, actor once)."""
+
     def expand(self) -> None:
         """Expand the configuration (mirrors SAC_CFG.expand)."""
         super().expand()
@@ -143,3 +153,13 @@ class RLPD_CFG(AgentCfg):
                 self.learning_rate_scheduler_kwargs,
                 self.learning_rate_scheduler_kwargs,
             )
+
+        # validate ensemble-related fields
+        if self.num_qs <= 0:
+            raise ValueError("num_qs must be >= 1")
+        if self.num_min_qs is None:
+            self.num_min_qs = self.num_qs
+        if self.num_min_qs <= 0 or self.num_min_qs > self.num_qs:
+            raise ValueError("num_min_qs must be in [1, num_qs]")
+        if self.utd_ratio <= 0:
+            raise ValueError("utd_ratio must be >= 1")

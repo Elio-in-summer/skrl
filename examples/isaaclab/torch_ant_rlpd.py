@@ -21,6 +21,9 @@ parser.add_argument("--critic_layer_norm", action="store_true", help="Enable Lay
 parser.add_argument("--ln_affine", dest="ln_affine", action="store_true", help="LayerNorm with learnable affine (gamma/beta)")
 parser.add_argument("--no_ln_affine", dest="ln_affine", action="store_false", help="LayerNorm without learnable affine")
 parser.set_defaults(ln_affine=True)
+parser.add_argument("--num_qs", type=int, default=5, help="Number of critic networks (ensemble size E)")
+parser.add_argument("--num_min_qs", type=int, default=2, help="Number of target critics for min (subset size M)")
+parser.add_argument("--utd_ratio", type=int, default=1, help="Update-to-data ratio (UTD)")
 
 # load the environment FIRST so that SimulationApp initializes and resolves
 # runtime libraries before importing torch/skrl heavy modules.
@@ -128,19 +131,22 @@ memory = RandomMemory(memory_size=16000, num_envs=env.num_envs, device=device)
 models = {}
 models["policy"] = StochasticActor(env.observation_space, env.state_space, env.action_space, device)
 
-# choose critic implementation
+# choose critic implementation and build ensemble
 if args.critic_layer_norm:
-    critic_cls = lambda: RLPDStateActionCritic(  # noqa: E731
-        env.observation_space, env.state_space, env.action_space, device,
-        hidden_dims=(512, 256), activation=nn.ReLU, layer_norm_affine=args.ln_affine,
-    )
+    def critic_factory():
+        return RLPDStateActionCritic(
+            env.observation_space, env.state_space, env.action_space, device,
+            hidden_dims=(512, 256), activation=nn.ReLU, layer_norm_affine=args.ln_affine,
+        )
 else:
-    critic_cls = lambda: Critic(env.observation_space, env.state_space, env.action_space, device)  # noqa: E731
+    def critic_factory():
+        return Critic(env.observation_space, env.state_space, env.action_space, device)
 
-models["critic_1"] = critic_cls()
-models["critic_2"] = critic_cls()
-models["target_critic_1"] = critic_cls()
-models["target_critic_2"] = critic_cls()
+E = max(1, int(args.num_qs))
+for i in range(1, E + 1):
+    models[f"critic_{i}"] = critic_factory()
+for i in range(1, E + 1):
+    models[f"target_critic_{i}"] = critic_factory()
 
 
 # configure and instantiate the agent (visit其文档查看所有参数)
@@ -156,14 +162,20 @@ cfg.learn_entropy = True
 cfg.initial_entropy_value = 1.0
 cfg.critic_layer_norm = args.critic_layer_norm
 cfg.layer_norm_affine = args.ln_affine
+cfg.num_qs = args.num_qs
+cfg.num_min_qs = args.num_min_qs
+cfg.utd_ratio = args.utd_ratio
 cfg.state_preprocessor = RunningStandardScaler
 cfg.state_preprocessor_kwargs = {"size": env.observation_space, "device": device}
 # logging to TensorBoard and write checkpoints (in timesteps)
 cfg.experiment.write_interval = "auto" if not args.eval else 0
 cfg.experiment.checkpoint_interval = "auto" if not args.eval else 0
-suffix = ""
+suffix_parts = []
 if args.critic_layer_norm:
-    suffix = "_LN" if args.ln_affine else "_LN_noaff"
+    suffix_parts.append("LN" if args.ln_affine else "LN_noaff")
+suffix_parts.append(f"Q{args.num_qs}M{args.num_min_qs}")
+suffix_parts.append(f"UTD{args.utd_ratio}")
+suffix = "_" + "_".join(suffix_parts) if suffix_parts else ""
 cfg.experiment.directory = f"runs/torch/{task_name}"
 
 agent = RLPD(
