@@ -24,6 +24,10 @@ parser.set_defaults(ln_affine=True)
 parser.add_argument("--num_qs", type=int, default=5, help="Number of critic networks (ensemble size E)")
 parser.add_argument("--num_min_qs", type=int, default=2, help="Number of target critics for min (subset size M)")
 parser.add_argument("--utd_ratio", type=int, default=1, help="Update-to-data ratio (UTD)")
+parser.add_argument("--offline_dataset", type=str, default=None, help="Path to offline dataset (.pt)")
+parser.add_argument("--offline_ratio", type=float, default=0.5, help="Fraction of each batch drawn from offline data")
+parser.add_argument("--offline_pretrain_steps", type=int, default=0, help="Number of offline-only updates before training")
+parser.add_argument("--rollout_dataset", type=str, default=None, help="Save collected transitions to this .pt file (forces eval mode)")
 
 # load the environment FIRST so that SimulationApp initializes and resolves
 # runtime libraries before importing torch/skrl heavy modules.
@@ -33,6 +37,7 @@ env = load_isaaclab_env(task_name=task_name, parser=parser, num_envs=64)
 # Now import torch/skrl heavy modules safely after SimulationApp is alive
 import torch
 import torch.nn as nn
+from skrl.datasets import OfflineDataset
 from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory
 from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
@@ -122,9 +127,27 @@ args, _ = parser.parse_known_args()
 # seed for reproducibility
 set_seed(args.seed)  # e.g. `set_seed(42)` for fixed seed
 
+if args.offline_ratio > 0.0 and not args.offline_dataset:
+    logger.error("--offline_ratio > 0 requires --offline_dataset")
+    exit(1)
+
 
 # instantiate a replay memory
-memory = RandomMemory(memory_size=16000, num_envs=env.num_envs, device=device)
+BASE_MEMORY_SIZE = 60000
+memory_device = device
+memory_size = BASE_MEMORY_SIZE
+if args.rollout_dataset:
+    requested_samples = env.num_envs * args.timesteps + 1
+    if requested_samples > BASE_MEMORY_SIZE:
+        logger.error(
+            "Rollout request (%d samples) exceeds memory capacity (%d). Reduce timesteps or num_envs.",
+            requested_samples,
+            BASE_MEMORY_SIZE,
+        )
+        exit(1)
+    memory_size = requested_samples
+    memory_device = "cpu"
+memory = RandomMemory(memory_size=memory_size, num_envs=env.num_envs, device=memory_device)
 
 
 # instantiate the agent's models (function approximators)
@@ -148,6 +171,11 @@ for i in range(1, E + 1):
 for i in range(1, E + 1):
     models[f"target_critic_{i}"] = critic_factory()
 
+offline_dataset = None
+if args.offline_dataset:
+    offline_dataset = OfflineDataset(device=device)
+    offline_dataset.load(args.offline_dataset)
+
 
 # configure and instantiate the agent (visit其文档查看所有参数)
 cfg = RLPD_CFG()
@@ -165,6 +193,8 @@ cfg.layer_norm_affine = args.ln_affine
 cfg.num_qs = args.num_qs
 cfg.num_min_qs = args.num_min_qs
 cfg.utd_ratio = args.utd_ratio
+cfg.offline_ratio = args.offline_ratio
+cfg.offline_pretrain_steps = args.offline_pretrain_steps
 cfg.state_preprocessor = RunningStandardScaler
 cfg.state_preprocessor_kwargs = {"size": env.observation_space, "device": device}
 # logging to TensorBoard and write checkpoints (in timesteps)
@@ -175,8 +205,10 @@ if args.critic_layer_norm:
     suffix_parts.append("LN" if args.ln_affine else "LN_noaff")
 suffix_parts.append(f"Q{args.num_qs}M{args.num_min_qs}")
 suffix_parts.append(f"UTD{args.utd_ratio}")
+if args.offline_dataset:
+    suffix_parts.append(f"Off{int(args.offline_ratio * 100):02d}")
 suffix = "_" + "_".join(suffix_parts) if suffix_parts else ""
-cfg.experiment.directory = f"runs/torch/{task_name}"
+cfg.experiment.directory = f"runs/torch/{task_name}{suffix}"
 
 agent = RLPD(
     models=models,
@@ -186,7 +218,15 @@ agent = RLPD(
     state_space=env.state_space,
     action_space=env.action_space,
     device=device,
+    offline_dataset=offline_dataset,
 )
+
+if args.offline_pretrain_steps > 0:
+    if offline_dataset is None:
+        logger.error("Offline pretraining requested but no offline dataset provided")
+        exit(1)
+    logger.info(f"Running {args.offline_pretrain_steps} offline pretrain updates")
+    agent.run_offline_updates(args.offline_pretrain_steps)
 
 
 # configure and instantiate the RL trainer
@@ -203,4 +243,26 @@ if args.checkpoint:
         exit(1)
     agent.load(args.checkpoint)
 
-trainer.train() if not args.eval else trainer.eval()
+run_eval = args.eval or bool(args.rollout_dataset)
+if run_eval:
+    trainer.eval()
+else:
+    trainer.train()
+
+if args.rollout_dataset:
+    num_samples = len(memory)
+    if num_samples == 0:
+        logger.warning("No samples collected; rollout dataset not saved")
+    else:
+        dataset = {}
+        for name in agent._tensors_names:
+            tensor_view = memory.tensors_view.get(name)
+            if tensor_view is None:
+                continue
+            tensor = tensor_view[:num_samples]
+            dataset[name] = tensor.clone().cpu()
+        output_dir = os.path.dirname(args.rollout_dataset)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        torch.save(dataset, args.rollout_dataset)
+        logger.info(f"Saved {num_samples} transitions to '{args.rollout_dataset}'")

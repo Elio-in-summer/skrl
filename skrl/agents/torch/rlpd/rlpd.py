@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from skrl import config, logger
 from skrl.agents.torch import Agent
+from skrl.datasets import OfflineDataset
 from skrl.memories.torch import Memory
 from skrl.models.torch import Model
 from skrl.utils import ScopedTimer
@@ -32,6 +33,7 @@ class RLPD(Agent):
         action_space: gymnasium.Space | None = None,
         device: str | torch.device | None = None,
         cfg: RLPD_CFG | dict = {},
+        offline_dataset: OfflineDataset | None = None,
     ) -> None:
         """RLPD (initial version: identical to SAC behavior).
 
@@ -44,6 +46,7 @@ class RLPD(Agent):
         :param action_space: Action space.
         :param device: Data allocation and computation device. If not specified, the default device will be used.
         :param cfg: Agent's configuration.
+        :param offline_dataset: Optional offline dataset (D buffer) used for hybrid updates.
 
         :raises KeyError: If a configuration key is missing.
         """
@@ -57,6 +60,7 @@ class RLPD(Agent):
             device=device,
             cfg=RLPD_CFG(**cfg) if isinstance(cfg, dict) else cfg,
         )
+        self.offline_dataset = offline_dataset
 
         # models
         self.policy = self.models.get("policy", None)
@@ -108,6 +112,10 @@ class RLPD(Agent):
                 f"[RLPD][WARNING] Number of target critics ({len(self.target_critics)}) != critics ({len(self.critics)}). "
                 "Training may fail; please check model assembly in the example script."
             )
+
+        self._offline_ratio = float(self.cfg.offline_ratio)
+        self._offline_mix_mode = self.cfg.offline_mix_mode.lower()
+        self._warned_offline_missing = False
 
         # broadcast models' parameters in distributed runs
         if config.torch.is_distributed:
@@ -331,42 +339,140 @@ class RLPD(Agent):
         # write tracking data and checkpoints
         super().post_interaction(timestep=timestep, timesteps=timesteps)
 
-    def update(self, *, timestep: int, timesteps: int) -> None:
-        """Algorithm's main update step.
+    def _batch_size_from_dict(self, batch: dict[str, torch.Tensor | None] | None) -> int:
+        if not batch:
+            return 0
+        for value in batch.values():
+            if value is None:
+                continue
+            if isinstance(value, dict):
+                for nested in value.values():
+                    if nested is not None:
+                        return nested.shape[0]
+                continue
+            return value.shape[0]
+        return 0
 
-        :param timestep: Current timestep.
-        :param timesteps: Number of timesteps.
-        """
-        # RLPD-style UTD: sample a large batch and slice into 'utd_ratio' mini-batches;
-        # update critics 'utd_ratio' times, then update actor/entropy once using the last mini-batch.
+    def _sample_online_batch(self, batch_size: int) -> dict[str, torch.Tensor | None] | None:
+        if batch_size <= 0 or self.memory is None:
+            return None
+        samples = self.memory.sample(names=self._tensors_names, batch_size=batch_size)[0]
+        return {name: tensor for name, tensor in zip(self._tensors_names, samples)}
+
+    def _sample_offline_batch(self, batch_size: int) -> dict[str, torch.Tensor | None] | None:
+        if batch_size <= 0:
+            return None
+        if self.offline_dataset is None:
+            if not self._warned_offline_missing:
+                logger.warning("Offline ratio requested but offline dataset is not available")
+                self._warned_offline_missing = True
+            raise RuntimeError("Offline updates requested without offline dataset")
+        batch = self.offline_dataset.sample(batch_size)
+        batch.setdefault("states", None)
+        batch.setdefault("next_states", None)
+        return batch
+
+    def _build_interleave_perm(self, offline_len: int, online_len: int) -> torch.Tensor:
+        order: List[int] = []
+        off_idx, on_idx = 0, 0
+        while off_idx < offline_len or on_idx < online_len:
+            if off_idx < offline_len:
+                order.append(off_idx)
+                off_idx += 1
+            if on_idx < online_len:
+                order.append(offline_len + on_idx)
+                on_idx += 1
+        return torch.tensor(order, device=self.device)
+
+    def _combine_batches(
+        self,
+        online_batch: dict[str, torch.Tensor | None] | None,
+        offline_batch: dict[str, torch.Tensor | None] | None,
+        online_len: int,
+        offline_len: int,
+    ) -> dict[str, torch.Tensor | None] | None:
+        if online_batch is None and offline_batch is None:
+            return None
+
+        combined: dict[str, torch.Tensor | None] = {}
+        total = online_len + offline_len
+        for key in self._tensors_names:
+            tensors = []
+            if offline_batch is not None and offline_batch.get(key) is not None:
+                tensors.append(offline_batch[key])
+            if online_batch is not None and online_batch.get(key) is not None:
+                tensors.append(online_batch[key])
+            if not tensors:
+                combined[key] = None
+            elif len(tensors) == 1:
+                combined[key] = tensors[0]
+            else:
+                combined[key] = torch.cat(tensors, dim=0)
+
+        if offline_len > 0 and online_len > 0 and total > 0:
+            perm = None
+            if self._offline_mix_mode == "interleave":
+                perm = self._build_interleave_perm(offline_len, online_len)
+            elif self._offline_mix_mode == "sequential":
+                perm = None
+            else:
+                perm = torch.randperm(total, device=self.device)
+
+            if perm is not None:
+                for key, value in combined.items():
+                    if value is not None and value.shape[0] == total:
+                        combined[key] = value.index_select(0, perm)
+
+        return combined
+
+    def _prepare_batch(self) -> tuple[dict[str, torch.Tensor | None] | None, int, int]:
+        utd = max(1, int(self.cfg.utd_ratio))
+        total_batch = self.cfg.batch_size * utd
+        if total_batch <= 0:
+            return None, 0, 0
+
+        desired_offline = int(total_batch * self._offline_ratio)
+        desired_online = total_batch - desired_offline
+
+        offline_batch = self._sample_offline_batch(desired_offline) if desired_offline > 0 else None
+        offline_len = self._batch_size_from_dict(offline_batch)
+
+        online_batch = self._sample_online_batch(desired_online) if desired_online > 0 else None
+        online_len = self._batch_size_from_dict(online_batch)
+
+        combined = self._combine_batches(online_batch, offline_batch, online_len, offline_len)
+        return combined, offline_len, online_len
+
+    def update(self, *, timestep: int, timesteps: int) -> None:
+        batch, offline_len, online_len = self._prepare_batch()
+        if batch is None:
+            return
+
+        self._update_from_batch(batch, offline_count=offline_len, online_count=online_len, log_prefix="")
+
+    def _update_from_batch(
+        self,
+        batch: dict[str, torch.Tensor | None],
+        *,
+        offline_count: int,
+        online_count: int,
+        log_prefix: str,
+    ) -> None:
         utd = max(1, int(self.cfg.utd_ratio))
 
-        # sample a batch from memory
-        (
-            sampled_observations,
-            sampled_states,
-            sampled_actions,
-            sampled_rewards,
-            sampled_next_observations,
-            sampled_next_states,
-            sampled_terminated,
-            sampled_truncated,
-        ) = self.memory.sample(names=self._tensors_names, batch_size=self.cfg.batch_size * utd)[0]
-
-        # split tensors into mini-batches
         def split_opt(x):
             if x is None:
                 return [None] * utd
             return torch.chunk(x, chunks=utd, dim=0)
 
-        obs_splits = split_opt(sampled_observations)
-        states_splits = split_opt(sampled_states)
-        acts_splits = split_opt(sampled_actions)
-        rews_splits = split_opt(sampled_rewards)
-        next_obs_splits = split_opt(sampled_next_observations)
-        next_states_splits = split_opt(sampled_next_states)
-        terminated_splits = split_opt(sampled_terminated)
-        truncated_splits = split_opt(sampled_truncated)
+        obs_splits = split_opt(batch["observations"])
+        states_splits = split_opt(batch.get("states"))
+        acts_splits = split_opt(batch["actions"])
+        rews_splits = split_opt(batch["rewards"])
+        next_obs_splits = split_opt(batch["next_observations"])
+        next_states_splits = split_opt(batch.get("next_states"))
+        terminated_splits = split_opt(batch["terminated"])
+        truncated_splits = split_opt(batch["truncated"])
 
         last_cache = None
 
@@ -391,7 +497,6 @@ class RLPD(Agent):
                 }
 
                 with torch.no_grad():
-                    # compute target values with REDQ subset min
                     next_actions, out_next = self.policy.act(next_inputs, role="policy")
                     next_log_prob = out_next["log_prob"]
 
@@ -399,7 +504,7 @@ class RLPD(Agent):
                     M = min(self.cfg.num_min_qs, E)
                     if E <= 0 or M <= 0:
                         raise ValueError(
-                            f"Empty target ensemble (E={E}, M={M}). Check that models contain 'target_critic_1..{self.cfg.num_qs}'. "
+                            f"Empty target ensemble (E={E}, M={M}). Check 'target_critic_i' models. "
                             f"Models: {sorted(list(self.models.keys()))}"
                         )
                     if M < E:
@@ -412,22 +517,20 @@ class RLPD(Agent):
                     for j, tc in enumerate(chosen_targets):
                         qv, _ = tc.act({**next_inputs, "taken_actions": next_actions}, role=f"target_critic_{j}")
                         target_q_list.append(qv)
-                    target_q_stack = torch.stack(target_q_list, dim=0)  # [M, B, 1]
-                    target_q_min, _ = torch.min(target_q_stack, dim=0)  # [B, 1]
+                    target_q_stack = torch.stack(target_q_list, dim=0)
+                    target_q_min, _ = torch.min(target_q_stack, dim=0)
                     target_q_values = target_q_min - self._entropy_coefficient * next_log_prob
                     target_values = (
                         rews + self.cfg.discount_factor * (terminated | truncated).logical_not() * target_q_values
                     )
 
-                # compute critic loss over ensemble
                 q_values = []
                 for j, c in enumerate(self.critics):
                     qj, _ = c.act({**inputs, "taken_actions": acts}, role=f"critic_{j}")
                     q_values.append(qj)
-                q_stack = torch.stack(q_values, dim=0)  # [E, B, 1]
+                q_stack = torch.stack(q_values, dim=0)
                 critic_loss = F.mse_loss(q_stack, target_values.expand_as(q_stack))
 
-            # optimization step (critic)
             self.critic_optimizer.zero_grad()
             self.scaler.scale(critic_loss).backward()
 
@@ -441,31 +544,24 @@ class RLPD(Agent):
 
             self.scaler.step(self.critic_optimizer)
 
-            # update target networks (polyak)
             for c, tc in zip(self.critics, self.target_critics):
                 tc.update_parameters(c, polyak=self.cfg.polyak)
 
-            # cache for actor/entropy step
-            last_cache = (inputs, q_stack, target_values, obs, states)
+            last_cache = (inputs, q_stack, target_values)
 
-        # actor and entropy update (once, on last mini-batch)
         if last_cache is not None:
-            inputs, q_stack, target_values, _, _ = last_cache
+            inputs, q_stack, target_values = last_cache
             with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
                 actions, outputs = self.policy.act(inputs, role="policy")
                 log_prob = outputs["log_prob"]
-                # compute Q across ensemble and average
                 q_values_pi = []
                 for j, c in enumerate(self.critics):
                     qj, _ = c.act({**inputs, "taken_actions": actions}, role=f"critic_{j}")
                     q_values_pi.append(qj)
-                q_pi_stack = torch.stack(q_values_pi, dim=0)  # [E, B, 1]
+                q_pi_stack = torch.stack(q_values_pi, dim=0)
                 q_pi_mean = torch.mean(q_pi_stack, dim=0)
-                # q_pi_min = torch.min(q_pi_stack, dim=0).values
                 policy_loss = (self._entropy_coefficient * log_prob - q_pi_mean).mean()
-                # policy_loss = (self._entropy_coefficient * log_prob - q_pi_min).mean()
 
-            # optimization step (policy)
             self.policy_optimizer.zero_grad()
             self.scaler.scale(policy_loss).backward()
 
@@ -478,7 +574,6 @@ class RLPD(Agent):
 
             self.scaler.step(self.policy_optimizer)
 
-            # entropy learning
             if self.cfg.learn_entropy:
                 with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
                     entropy_loss = -(self.log_entropy_coefficient * (log_prob + self._target_entropy).detach()).mean()
@@ -487,48 +582,70 @@ class RLPD(Agent):
                 self.scaler.step(self.entropy_optimizer)
                 self._entropy_coefficient = torch.exp(self.log_entropy_coefficient.detach())
 
-            self.scaler.update()  # after optimizers have been stepped
+            self.scaler.update()
 
-            # update learning rate schedulers once per update
             if self.policy_scheduler:
                 self.policy_scheduler.step()
             if self.critic_scheduler:
                 self.critic_scheduler.step()
 
-            # record data
+            prefix = f"{log_prefix} / " if log_prefix else ""
             if self.write_interval > 0:
-                # generic losses
-                self.track_data("Loss / Policy loss", policy_loss.item())
-                self.track_data("Loss / Critic loss", critic_loss.item())
+                self.track_data(f"{prefix}Loss / Policy loss", policy_loss.item())
+                self.track_data(f"{prefix}Loss / Critic loss", critic_loss.item())
 
-                # ensemble statistics on last mini-batch
-                # reuse q_stack from critic step (on data) and q_pi_stack (on policy actions)
-                # Here log stats for q_stack (data batch)
-                q_vals = q_stack  # [E, B, 1]
+                q_vals = q_stack
                 q_vals_mean = torch.mean(q_vals)
                 q_vals_max = torch.max(q_vals)
                 q_vals_min = torch.min(q_vals)
-                q_ens_std = torch.std(q_vals.squeeze(-1), dim=0).mean()  # mean std across batch
+                q_ens_std = torch.std(q_vals.squeeze(-1), dim=0).mean()
 
-                self.track_data("Q-ensemble / Q (max)", q_vals_max.item())
-                self.track_data("Q-ensemble / Q (min)", q_vals_min.item())
-                self.track_data("Q-ensemble / Q (mean)", q_vals_mean.item())
-                self.track_data("Q-ensemble / Ensemble std", q_ens_std.item())
+                self.track_data(f"{prefix}Q-ensemble / Q (max)", q_vals_max.item())
+                self.track_data(f"{prefix}Q-ensemble / Q (min)", q_vals_min.item())
+                self.track_data(f"{prefix}Q-ensemble / Q (mean)", q_vals_mean.item())
+                self.track_data(f"{prefix}Q-ensemble / Ensemble std", q_ens_std.item())
 
-                self.track_data("Target / Target (max)", torch.max(target_values).item())
-                self.track_data("Target / Target (min)", torch.min(target_values).item())
-                self.track_data("Target / Target (mean)", torch.mean(target_values).item())
+                self.track_data(f"{prefix}Target / Target (max)", torch.max(target_values).item())
+                self.track_data(f"{prefix}Target / Target (min)", torch.min(target_values).item())
+                self.track_data(f"{prefix}Target / Target (mean)", torch.mean(target_values).item())
 
                 if self.cfg.learn_entropy:
-                    self.track_data("Loss / Entropy loss", entropy_loss.item())
-                    self.track_data("Coefficient / Entropy coefficient", self._entropy_coefficient.item())
+                    self.track_data(f"{prefix}Loss / Entropy loss", entropy_loss.item())
+                    self.track_data(
+                        f"{prefix}Coefficient / Entropy coefficient", self._entropy_coefficient.item()
+                    )
 
                 if self.policy_scheduler:
-                    self.track_data("Learning / Policy learning rate", self.policy_scheduler.get_last_lr()[0])
+                    self.track_data(f"{prefix}Learning / Policy learning rate", self.policy_scheduler.get_last_lr()[0])
                 if self.critic_scheduler:
-                    self.track_data("Learning / Critic learning rate", self.critic_scheduler.get_last_lr()[0])
+                    self.track_data(f"{prefix}Learning / Critic learning rate", self.critic_scheduler.get_last_lr()[0])
 
-                # log hparams as scalars (cheap) for traceability
-                self.track_data("Ensemble / num_qs", float(len(self.critics)))
-                self.track_data("Ensemble / num_min_qs", float(min(self.cfg.num_min_qs, len(self.critics))))
-                self.track_data("Learning / UTD ratio", float(utd))
+                total_samples = offline_count + online_count
+                if total_samples > 0:
+                    self.track_data(f"{prefix}Data / Offline count", float(offline_count))
+                    self.track_data(f"{prefix}Data / Online count", float(online_count))
+                    self.track_data(
+                        f"{prefix}Data / Offline ratio",
+                        float(offline_count) / float(total_samples),
+                    )
+
+    def run_offline_updates(self, steps: int, *, batch_size: int | None = None) -> None:
+        if steps <= 0:
+            return
+        if self.offline_dataset is None:
+            logger.warning("Offline pretraining requested but no offline dataset is available")
+            return
+        utd = max(1, int(self.cfg.utd_ratio))
+        total_batch = (batch_size or self.cfg.batch_size) * utd
+        for _ in range(steps):
+            offline_batch = self._sample_offline_batch(total_batch)
+            offline_len = self._batch_size_from_dict(offline_batch)
+            combined = self._combine_batches(None, offline_batch, 0, offline_len)
+            if combined is None:
+                break
+            self._update_from_batch(combined, offline_count=offline_len, online_count=0, log_prefix="Offline Pretrain")
+
+            # log hparams as scalars (cheap) for traceability
+            self.track_data("Ensemble / num_qs", float(len(self.critics)))
+            self.track_data("Ensemble / num_min_qs", float(min(self.cfg.num_min_qs, len(self.critics))))
+            self.track_data("Learning / UTD ratio", float(utd))

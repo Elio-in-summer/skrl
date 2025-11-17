@@ -131,6 +131,15 @@ class RLPD_CFG(AgentCfg):
     utd_ratio: int = 1
     """Update-to-data ratio (slice a large batch into this many mini-batches; update critics UTD times, actor once)."""
 
+    offline_ratio: float = 0.0
+    """Fraction of each training batch sourced from offline data (D buffer)."""
+
+    offline_pretrain_steps: int = 0
+    """Number of offline-only update iterations to run before interacting with the environment."""
+
+    offline_mix_mode: str = "shuffle"
+    """Strategy to merge offline and online samples. Options: ``shuffle`` (default), ``interleave``, ``sequential``."""
+
     def expand(self) -> None:
         """Expand the configuration (mirrors SAC_CFG.expand)."""
         super().expand()
@@ -163,3 +172,13 @@ class RLPD_CFG(AgentCfg):
             raise ValueError("num_min_qs must be in [1, num_qs]")
         if self.utd_ratio <= 0:
             raise ValueError("utd_ratio must be >= 1")
+
+        if not 0.0 <= self.offline_ratio <= 1.0:
+            raise ValueError("offline_ratio must be in [0, 1]")
+        if self.offline_pretrain_steps < 0:
+            raise ValueError("offline_pretrain_steps must be >= 0")
+        allowed_mix_modes = {"shuffle", "interleave", "sequential"}
+        if self.offline_mix_mode.lower() not in allowed_mix_modes:
+            raise ValueError(
+                f"offline_mix_mode must be one of {allowed_mix_modes}, got '{self.offline_mix_mode}'"
+            )
