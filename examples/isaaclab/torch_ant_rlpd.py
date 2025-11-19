@@ -28,6 +28,8 @@ parser.add_argument("--offline_dataset", type=str, default=None, help="Path to o
 parser.add_argument("--offline_ratio", type=float, default=0.5, help="Fraction of each batch drawn from offline data")
 parser.add_argument("--offline_pretrain_steps", type=int, default=0, help="Number of offline-only updates before training")
 parser.add_argument("--rollout_dataset", type=str, default=None, help="Save collected transitions to this .pt file (forces eval mode)")
+parser.add_argument("--wandb_project", type=str, default=None, help="Weights & Biases project (optional)")
+parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name (optional)")
 
 # load the environment FIRST so that SimulationApp initializes and resolves
 # runtime libraries before importing torch/skrl heavy modules.
@@ -37,6 +39,8 @@ env = load_isaaclab_env(task_name=task_name, parser=parser, num_envs=64)
 # Now import torch/skrl heavy modules safely after SimulationApp is alive
 import torch
 import torch.nn as nn
+from types import MethodType
+
 from skrl.datasets import OfflineDataset
 from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory
@@ -123,6 +127,7 @@ device = env.device
 # defer parsing of arguments to include loader arguments (run with --help to see all the arguments)
 args, _ = parser.parse_known_args()
 
+wandb_run = None
 
 # seed for reproducibility
 set_seed(args.seed)  # e.g. `set_seed(42)` for fixed seed
@@ -221,6 +226,30 @@ agent = RLPD(
     offline_dataset=offline_dataset,
 )
 
+if args.wandb_project:
+    import wandb
+
+    wandb_run = wandb.init(
+        project=args.wandb_project,
+        name=args.wandb_run_name,
+        config={k: getattr(args, k) for k in vars(args)},
+    )
+
+    original_write_tracking_data = agent.write_tracking_data
+
+    def write_tracking_data_with_wandb(self, *, timestep: int, timesteps: int) -> None:
+        if self.tracking_data:
+            metrics = {}
+            for key, values in self.tracking_data.items():
+                if values:
+                    metrics[key] = sum(values) / len(values)
+            if metrics:
+                metrics.setdefault("timestep", timestep)
+                wandb_run.log(metrics, step=timestep)
+        original_write_tracking_data(timestep=timestep, timesteps=timesteps)
+
+    agent.write_tracking_data = MethodType(write_tracking_data_with_wandb, agent)
+
 
 # configure and instantiate the RL trainer
 cfg_trainer = {
@@ -266,3 +295,6 @@ if args.rollout_dataset:
             os.makedirs(output_dir, exist_ok=True)
         torch.save(dataset, args.rollout_dataset)
         logger.info(f"Saved {num_samples} transitions to '{args.rollout_dataset}'")
+
+if wandb_run is not None:
+    wandb_run.finish()
