@@ -584,13 +584,13 @@ class RLPD(Agent):
 
             self.scaler.update()
 
-            if self.policy_scheduler:
-                self.policy_scheduler.step()
-            if self.critic_scheduler:
-                self.critic_scheduler.step()
+        if self.policy_scheduler:
+            self.policy_scheduler.step()
+        if self.critic_scheduler:
+            self.critic_scheduler.step()
 
-            prefix = f"{log_prefix} / " if log_prefix else ""
-            if self.write_interval > 0:
+        prefix = f"{log_prefix} / " if log_prefix else ""
+        if self.write_interval > 0:
                 self.track_data(f"{prefix}Loss / Policy loss", policy_loss.item())
                 self.track_data(f"{prefix}Loss / Critic loss", critic_loss.item())
 
@@ -637,7 +637,9 @@ class RLPD(Agent):
             return
         utd = max(1, int(self.cfg.utd_ratio))
         total_batch = (batch_size or self.cfg.batch_size) * utd
-        for _ in range(steps):
+        import tqdm
+
+        for _ in tqdm.tqdm(range(steps), desc="Offline pretrain", leave=False):
             offline_batch = self._sample_offline_batch(total_batch)
             offline_len = self._batch_size_from_dict(offline_batch)
             combined = self._combine_batches(None, offline_batch, 0, offline_len)

@@ -221,13 +221,6 @@ agent = RLPD(
     offline_dataset=offline_dataset,
 )
 
-if args.offline_pretrain_steps > 0:
-    if offline_dataset is None:
-        logger.error("Offline pretraining requested but no offline dataset provided")
-        exit(1)
-    logger.info(f"Running {args.offline_pretrain_steps} offline pretrain updates")
-    agent.run_offline_updates(args.offline_pretrain_steps)
-
 
 # configure and instantiate the RL trainer
 cfg_trainer = {
@@ -242,6 +235,13 @@ if args.checkpoint:
         logger.error(f"Checkpoint file not found: '{args.checkpoint}'")
         exit(1)
     agent.load(args.checkpoint)
+
+if args.offline_pretrain_steps > 0:
+    if offline_dataset is None:
+        logger.error("Offline pretraining requested but no offline dataset provided")
+        exit(1)
+    logger.info(f"Running {args.offline_pretrain_steps} offline pretrain updates")
+    agent.run_offline_updates(args.offline_pretrain_steps)
 
 run_eval = args.eval or bool(args.rollout_dataset)
 if run_eval:
