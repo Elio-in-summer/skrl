@@ -17,6 +17,9 @@
 events.out.tfevents.*
 runs
 
+###image
+*.png
+
 ### C ###
 # Prerequisites
 *.d

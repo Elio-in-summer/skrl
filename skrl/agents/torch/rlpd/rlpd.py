@@ -475,6 +475,9 @@ class RLPD(Agent):
         truncated_splits = split_opt(batch["truncated"])
 
         last_cache = None
+        # for logging comparisons with entropy coefficient
+        mean_log_prob = None
+        mean_log_prob_plus_target = None
 
         for i in range(utd):
             obs = obs_splits[i]
@@ -499,6 +502,13 @@ class RLPD(Agent):
                 with torch.no_grad():
                     next_actions, out_next = self.policy.act(next_inputs, role="policy")
                     next_log_prob = out_next["log_prob"]
+                    # debug: detect exploding actions early
+                    if torch.isnan(next_actions).any() or torch.isinf(next_actions).any():
+                        print("[DEBUG][RLPD] next_actions contains NaN/Inf:", next_actions.detach().cpu())
+                    else:
+                        max_abs = next_actions.abs().max().item()
+                        if max_abs > 10.0:
+                            print(f"[DEBUG][RLPD] next_actions abs max is large: {max_abs:.3f}")
 
                     E = len(self.target_critics)
                     M = min(self.cfg.num_min_qs, E)
@@ -519,7 +529,8 @@ class RLPD(Agent):
                         target_q_list.append(qv)
                     target_q_stack = torch.stack(target_q_list, dim=0)
                     target_q_min, _ = torch.min(target_q_stack, dim=0)
-                    target_q_values = target_q_min - self._entropy_coefficient * next_log_prob
+                    # target_q_values = target_q_min - self._entropy_coefficient * next_log_prob
+                    target_q_values = target_q_min
                     target_values = (
                         rews + self.cfg.discount_factor * (terminated | truncated).logical_not() * target_q_values
                     )
@@ -528,8 +539,13 @@ class RLPD(Agent):
                 for j, c in enumerate(self.critics):
                     qj, _ = c.act({**inputs, "taken_actions": acts}, role=f"critic_{j}")
                     q_values.append(qj)
+                    if torch.isnan(qj).any() or torch.isinf(qj).any():
+                        print(f"[DEBUG][RLPD] critic_{j} output has NaN/Inf:", qj.detach().cpu())
                 q_stack = torch.stack(q_values, dim=0)
                 critic_loss = F.mse_loss(q_stack, target_values.expand_as(q_stack))
+                if torch.isnan(critic_loss) or torch.isinf(critic_loss):
+                    print("[DEBUG][RLPD] critic_loss became NaN/Inf. "
+                          "Inspect inputs/targets for instability.")
 
             self.critic_optimizer.zero_grad()
             self.scaler.scale(critic_loss).backward()
@@ -561,6 +577,25 @@ class RLPD(Agent):
                 q_pi_stack = torch.stack(q_values_pi, dim=0)
                 q_pi_mean = torch.mean(q_pi_stack, dim=0)
                 policy_loss = (self._entropy_coefficient * log_prob - q_pi_mean).mean()
+                # capture E[log_prob] and E[log_prob + target] for logging next to alpha
+                try:
+                    mean_log_prob = torch.mean(log_prob.detach())
+                    if self.cfg.learn_entropy:
+                        # ensure dtype/device match for numerical stability
+                        _target = torch.as_tensor(self._target_entropy, device=log_prob.device, dtype=log_prob.dtype)
+                        mean_log_prob_plus_target = torch.mean((log_prob + _target).detach())
+                except Exception:
+                    mean_log_prob = None
+                    mean_log_prob_plus_target = None
+                # optional diagnostic: variance incentive from Q wrt action
+                variance_incentive = None
+                try:
+                    if outputs.get("mean_actions", None) is not None:
+                        dqda = torch.autograd.grad(q_pi_mean.mean(), actions, retain_graph=True, create_graph=False)[0]
+                        variance_incentive = (dqda * (actions - outputs["mean_actions"]))
+                        variance_incentive = variance_incentive.sum(dim=-1).mean().detach()
+                except Exception:
+                    variance_incentive = None
 
             self.policy_optimizer.zero_grad()
             self.scaler.scale(policy_loss).backward()
@@ -614,6 +649,16 @@ class RLPD(Agent):
                     self.track_data(
                         f"{prefix}Coefficient / Entropy coefficient", self._entropy_coefficient.item()
                     )
+                    # extra diagnostics to compare with alpha dynamics
+                    if mean_log_prob is not None:
+                        self.track_data(f"{prefix}Coefficient / E[log_prob]", float(mean_log_prob.item()))
+                    if mean_log_prob_plus_target is not None:
+                        self.track_data(f"{prefix}Coefficient / E[log_prob + target]", float(mean_log_prob_plus_target.item()))
+                    if variance_incentive is not None:
+                        self.track_data(
+                            f"{prefix}Coefficient / Variance incentive E[dQ/da · (a - mean)]",
+                            float(variance_incentive.item()),
+                        )
 
                 if self.policy_scheduler:
                     self.track_data(f"{prefix}Learning / Policy learning rate", self.policy_scheduler.get_last_lr()[0])
