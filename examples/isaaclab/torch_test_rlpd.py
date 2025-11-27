@@ -1,5 +1,6 @@
 import argparse
 import os
+from datetime import datetime
 from typing import Optional, cast
 
 # IMPORTANT: delay importing torch/skrl heavy modules until after SimulationApp
@@ -7,6 +8,22 @@ from typing import Optional, cast
 # by letting Isaac Sim's runtime be loaded first.
 from skrl import logger
 from skrl.envs.loaders.torch import load_isaaclab_env
+
+WANDB_PROJECT_NAME = "Cube-Allegro"
+WANDB_ENTITY_NAME = "DexGen_ZBL"
+WANDB_CONFIG_KEYS = (
+    "gradient_steps",
+    "batch_size",
+    "learning_rate",
+    "critic_layer_norm",
+    "ln_affine",
+    "num_qs",
+    "num_min_qs",
+    "utd_ratio",
+    "offline_dataset",
+    "offline_ratio",
+    "offline_pretrain_steps",
+)
 
 
 # parse arguments
@@ -29,8 +46,19 @@ parser.add_argument("--offline_dataset", type=str, default=None, help="Path to o
 parser.add_argument("--offline_ratio", type=float, default=0.5, help="Fraction of each batch drawn from offline data")
 parser.add_argument("--offline_pretrain_steps", type=int, default=0, help="Number of offline-only updates before training")
 parser.add_argument("--rollout_dataset", type=str, default=None, help="Save collected transitions to this .pt file (forces eval mode)")
-parser.add_argument("--wandb_project", type=str, default=None, help="Weights & Biases project (optional)")
-parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name (optional)")
+parser.add_argument(
+    "--wandb_run_name",
+    type=str,
+    default=None,
+    help="Weights & Biases run name suffix (prefixed with YYYYMMDD)",
+)
+parser.add_argument(
+    "--wandb_tags",
+    type=str,
+    nargs="*",
+    default=None,
+    help="Optional list of tags for the W&B run",
+)
 
 # load the environment FIRST so that SimulationApp initializes and resolves
 # runtime libraries before importing torch/skrl heavy modules.
@@ -205,17 +233,7 @@ cfg.state_preprocessor_kwargs = {"size": observation_space, "device": device}
 # logging to TensorBoard and write checkpoints (in timesteps)
 cfg.experiment.write_interval = "auto" if not args.eval else 0
 cfg.experiment.checkpoint_interval = "auto" if not args.eval else 0
-suffix_parts = []
 
-
-if args.critic_layer_norm:
-    suffix_parts.append("LN" if args.ln_affine else "LN_noaff")
-suffix_parts.append(f"Q{args.num_qs}M{args.num_min_qs}")
-suffix_parts.append(f"UTD{args.utd_ratio}")
-if args.offline_dataset:
-    suffix_parts.append(f"Off{int(args.offline_ratio * 100):02d}")
-suffix = "_" + "_".join(suffix_parts) if suffix_parts else ""
-cfg.experiment.directory = f"runs/torch/{task_name}{suffix}"
 
 agent = RLPD(
     models=models,
@@ -228,29 +246,56 @@ agent = RLPD(
     offline_dataset=offline_dataset,
 )
 
-if args.wandb_project:
-    import wandb
 
-    wandb_run = wandb.init(
-        project=args.wandb_project,
-        name=args.wandb_run_name,
-        config={k: getattr(args, k) for k in vars(args)},
-    )
+import wandb
 
-    original_write_tracking_data = agent.write_tracking_data
+date_prefix = datetime.now().strftime("%Y%m%d")
+run_name_suffix = args.wandb_run_name or ""
+wandb_run_name = (
+    f"{date_prefix}{run_name_suffix}" if run_name_suffix else date_prefix
+)
 
-    def write_tracking_data_with_wandb(self, *, timestep: int, timesteps: int) -> None:
-        if self.tracking_data:
-            metrics = {}
-            for key, values in self.tracking_data.items():
-                if values:
-                    metrics[key] = sum(values) / len(values)
-            if metrics:
-                metrics.setdefault("timestep", timestep)
-                wandb_run.log(metrics, step=timestep)
-        original_write_tracking_data(timestep=timestep, timesteps=timesteps)
+tags = args.wandb_tags or None
+if tags:
+    if len(tags) == 1 and "," in tags[0]:
+        tags = [tag.strip() for tag in tags[0].split(",") if tag.strip()]
+    if not tags:
+        tags = None
 
-    agent.write_tracking_data = MethodType(write_tracking_data_with_wandb, agent)
+wandb_config = {key: getattr(args, key, None) for key in WANDB_CONFIG_KEYS}
+wandb_config["num_envs"] = env.num_envs
+state_preprocessor = getattr(
+    cfg.state_preprocessor,
+    "__name__",
+    str(cfg.state_preprocessor),
+)
+wandb_config["state_preprocessor"] = state_preprocessor
+
+wandb_run = wandb.init(
+    project=WANDB_PROJECT_NAME,
+    entity=WANDB_ENTITY_NAME,
+    name=wandb_run_name,
+    config=wandb_config,
+    tags=tags,
+)
+
+cfg.experiment.directory = f"runs/torch/{WANDB_PROJECT_NAME}/{wandb_run_name}"
+original_write_tracking_data = agent.write_tracking_data
+
+
+def write_tracking_data_with_wandb(self, *, timestep: int, timesteps: int) -> None:
+    if self.tracking_data:
+        metrics = {}
+        for key, values in self.tracking_data.items():
+            if values:
+                metrics[key] = sum(values) / len(values)
+        if metrics:
+            metrics.setdefault("timestep", timestep)
+            wandb_run.log(metrics, step=timestep)
+    original_write_tracking_data(timestep=timestep, timesteps=timesteps)
+
+
+agent.write_tracking_data = MethodType(write_tracking_data_with_wandb, agent)
 
 
 # configure and instantiate the RL trainer
