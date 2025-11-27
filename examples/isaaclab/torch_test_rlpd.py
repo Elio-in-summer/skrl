@@ -1,5 +1,6 @@
 import argparse
 import os
+from typing import Optional, cast
 
 # IMPORTANT: delay importing torch/skrl heavy modules until after SimulationApp
 # is created (via load_isaaclab_env). This avoids GLIBCXX/libstdc++ conflicts
@@ -12,7 +13,7 @@ from skrl.envs.loaders.torch import load_isaaclab_env
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", type=str, default=None, help="Load checkpoint from path")
 parser.add_argument("--eval", action="store_true", help="Run in evaluation mode (logging/checkpointing disabled)")
-parser.add_argument("--timesteps", type=int, default=50000, help="Number of timesteps to run the trainer")
+parser.add_argument("--timesteps", type=int, default=100000, help="Number of timesteps to run the trainer")
 parser.add_argument("--no_pbar", action="store_true", help="Disable progress bar output")
 parser.add_argument("--gradient_steps", type=int, default=1, help="Number of gradient steps per env step")
 parser.add_argument("--batch_size", type=int, default=256, help="Batch size for updates")
@@ -41,61 +42,17 @@ import torch
 import torch.nn as nn
 from types import MethodType
 
+import gymnasium as gym
 from skrl.datasets import OfflineDataset
 from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory
-from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
+from skrl.models.torch import DeterministicMixin, Model
+from skrl.models.torch.rlpd_actor import RLPDTanhGaussianActor
 from skrl.models.torch.mlp_ln import RLPDStateActionCritic
 from skrl.agents.torch.rlpd import RLPD, RLPD_CFG
 from skrl.resources.preprocessors.torch import RunningStandardScaler
 from skrl.trainers.torch import SequentialTrainer
 from skrl.utils import set_seed
-
-
-# define models (stochastic and deterministic models) using mixins
-class StochasticActor(GaussianMixin, Model):
-    def __init__(
-        self,
-        observation_space,
-        state_space,
-        action_space,
-        device,
-        clip_actions=True,
-        clip_log_std=True,
-        min_log_std=-5,
-        max_log_std=2,
-        reduction="sum",
-    ):
-        Model.__init__(
-            self,
-            observation_space=observation_space,
-            state_space=state_space,
-            action_space=action_space,
-            device=device,
-        )
-        GaussianMixin.__init__(
-            self,
-            clip_actions=clip_actions,
-            clip_log_std=clip_log_std,
-            min_log_std=min_log_std,
-            max_log_std=max_log_std,
-            reduction=reduction,
-        )
-
-        self.net = nn.Sequential(
-            nn.Linear(self.num_observations, 512),
-            nn.ELU(),
-            nn.Linear(512, 256),
-            nn.ELU(),
-            nn.Linear(256, 128),
-            nn.ELU(),
-            nn.Linear(128, self.num_actions),
-            nn.Tanh(),
-        )
-        self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
-
-    def compute(self, inputs, role):
-        return self.net(inputs["observations"]), {"log_std": self.log_std_parameter}
 
 
 class Critic(DeterministicMixin, Model):
@@ -125,12 +82,16 @@ class Critic(DeterministicMixin, Model):
 
 # wrap the environment
 env = wrap_env(env)
+observation_space = cast(gym.Space, env.observation_space)
+state_space = cast(Optional[gym.Space], getattr(env, "state_space", None))
+action_space = cast(gym.Space, env.action_space)
+
 # Isaac Lab joint targets expect [-1, 1]; override underlying Box so GaussianMixin can clamp
 try:
     import numpy as np
     from gymnasium import spaces
 
-    act_shape = env.action_space.shape
+    act_shape = action_space.shape
     bounded_space = spaces.Box(
         low=-np.ones(act_shape, dtype=np.float32),
         high=np.ones(act_shape, dtype=np.float32),
@@ -151,9 +112,9 @@ wandb_run = None
 # seed for reproducibility
 set_seed(args.seed)  # e.g. `set_seed(42)` for fixed seed
 
-# if args.offline_ratio > 0.0 and not args.offline_dataset:
-#     logger.error("--offline_ratio > 0 requires --offline_dataset")
-#     exit(1)
+if args.offline_ratio > 0.0 and not args.offline_dataset:
+    logger.error("--offline_ratio > 0 requires --offline_dataset")
+    exit(1)
 
 
 # instantiate a replay memory
@@ -178,19 +139,34 @@ memory = RandomMemory(memory_size=memory_size, num_envs=env.num_envs, device=mem
 
 # instantiate the agent's models (function approximators)
 models = {}
-models["policy"] = StochasticActor(env.observation_space, env.state_space, env.action_space, device)
+models["policy"] = RLPDTanhGaussianActor(
+    observation_space,
+    state_space,
+    action_space,
+    device,
+    hidden_dims=(512, 256, 128),
+    activation=nn.ELU,
+    log_std_bounds=(-5.0, 2.0),
+)
 
 # choose critic implementation and build ensemble
 if args.critic_layer_norm:
     logger.info("Using RLPDStateActionCritic with layer normalization")
-    def critic_factory():
+
+
+def critic_factory():
+    if args.critic_layer_norm:
         return RLPDStateActionCritic(
-            env.observation_space, env.state_space, env.action_space, device,
-            hidden_dims=(512, 256, 128), activation=nn.ELU, layer_norm_affine=args.ln_affine,
+            observation_space,
+            state_space,
+            action_space,
+            device,
+            hidden_dims=(512, 256, 128),
+            activation=nn.ELU,
+            layer_norm_affine=args.ln_affine,
         )
-else:
-    def critic_factory():
-        return Critic(env.observation_space, env.state_space, env.action_space, device)
+    return Critic(observation_space, state_space, action_space, device)
+
 
 E = max(1, int(args.num_qs))
 for i in range(1, E + 1):
@@ -213,8 +189,8 @@ cfg.polyak = 0.005
 cfg.learning_rate = args.learning_rate
 cfg.random_timesteps = 1000  # better early coverage; can be overridden below
 cfg.learning_starts = 1000
-cfg.learn_entropy = False
-cfg.initial_entropy_value = 1e-2
+cfg.learn_entropy = True
+cfg.initial_entropy_value = 1
 cfg.critic_layer_norm = args.critic_layer_norm
 cfg.layer_norm_affine = args.ln_affine
 cfg.num_qs = args.num_qs
@@ -222,12 +198,16 @@ cfg.num_min_qs = args.num_min_qs
 cfg.utd_ratio = args.utd_ratio
 cfg.offline_ratio = args.offline_ratio
 cfg.offline_pretrain_steps = args.offline_pretrain_steps
+
 cfg.state_preprocessor = RunningStandardScaler
-cfg.state_preprocessor_kwargs = {"size": env.observation_space, "device": device}
+cfg.state_preprocessor_kwargs = {"size": observation_space, "device": device}
+
 # logging to TensorBoard and write checkpoints (in timesteps)
 cfg.experiment.write_interval = "auto" if not args.eval else 0
 cfg.experiment.checkpoint_interval = "auto" if not args.eval else 0
 suffix_parts = []
+
+
 if args.critic_layer_norm:
     suffix_parts.append("LN" if args.ln_affine else "LN_noaff")
 suffix_parts.append(f"Q{args.num_qs}M{args.num_min_qs}")
@@ -241,9 +221,9 @@ agent = RLPD(
     models=models,
     memory=memory,
     cfg=cfg,
-    observation_space=env.observation_space,
-    state_space=env.state_space,
-    action_space=env.action_space,
+    observation_space=observation_space,
+    state_space=state_space,
+    action_space=action_space,
     device=device,
     offline_dataset=offline_dataset,
 )

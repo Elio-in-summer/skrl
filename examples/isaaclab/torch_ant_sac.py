@@ -1,5 +1,6 @@
 import argparse
 import os
+from typing import Optional, cast
 
 # IMPORTANT: delay importing torch/skrl heavy modules until after SimulationApp
 # is created (via load_isaaclab_env). This avoids GLIBCXX/libstdc++ conflicts
@@ -13,8 +14,6 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", type=str, default=None, help="Load checkpoint from path")
 parser.add_argument("--eval", action="store_true", help="Run in evaluation mode (logging/checkpointing disabled)")
 
-
-
 # load the environment FIRST so that SimulationApp initializes and resolves
 # runtime libraries before importing torch/skrl heavy modules.
 task_name = "Isaac-Ant-Direct-v0"
@@ -23,57 +22,15 @@ env = load_isaaclab_env(task_name=task_name, parser=parser, num_envs=64)
 # Now import torch/skrl heavy modules safely after SimulationApp is alive
 import torch
 import torch.nn as nn
+import gymnasium as gym
 from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory
-from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
+from skrl.models.torch import DeterministicMixin, Model
+from skrl.models.torch.rlpd_actor import RLPDTanhGaussianActor
 from skrl.agents.torch.sac import SAC, SAC_CFG
 from skrl.resources.preprocessors.torch import RunningStandardScaler
 from skrl.trainers.torch import SequentialTrainer
 from skrl.utils import set_seed
-
-
-# define models (stochastic and deterministic models) using mixins
-class StochasticActor(GaussianMixin, Model):
-    def __init__(
-        self,
-        observation_space,
-        state_space,
-        action_space,
-        device,
-        clip_actions=False,
-        clip_log_std=True,
-        min_log_std=-5,
-        max_log_std=2,
-        reduction="sum",
-    ):
-        Model.__init__(
-            self,
-            observation_space=observation_space,
-            state_space=state_space,
-            action_space=action_space,
-            device=device,
-        )
-        GaussianMixin.__init__(
-            self,
-            clip_actions=clip_actions,
-            clip_log_std=clip_log_std,
-            min_log_std=min_log_std,
-            max_log_std=max_log_std,
-            reduction=reduction,
-        )
-
-        self.net = nn.Sequential(
-            nn.Linear(self.num_observations, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, self.num_actions),
-            nn.Tanh(),
-        )
-        self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
-
-    def compute(self, inputs, role):
-        return self.net(inputs["observations"]), {"log_std": self.log_std_parameter}
 
 
 class Critic(DeterministicMixin, Model):
@@ -103,6 +60,10 @@ class Critic(DeterministicMixin, Model):
 env = wrap_env(env)
 device = env.device
 
+observation_space = cast(gym.Space, env.observation_space)
+state_space = cast(Optional[gym.Space], getattr(env, "state_space", None))
+action_space = cast(gym.Space, env.action_space)
+
 
 # defer parsing of arguments to include loader arguments (run with --help to see all the arguments)
 args, _ = parser.parse_known_args()
@@ -120,11 +81,19 @@ memory = RandomMemory(memory_size=16000, num_envs=env.num_envs, device=device)
 # SAC requires 5 models, visit its documentation for more details
 # https://skrl.readthedocs.io/en/latest/api/agents/sac.html#models
 models = {}
-models["policy"] = StochasticActor(env.observation_space, env.state_space, env.action_space, device)
-models["critic_1"] = Critic(env.observation_space, env.state_space, env.action_space, device)
-models["critic_2"] = Critic(env.observation_space, env.state_space, env.action_space, device)
-models["target_critic_1"] = Critic(env.observation_space, env.state_space, env.action_space, device)
-models["target_critic_2"] = Critic(env.observation_space, env.state_space, env.action_space, device)
+models["policy"] = RLPDTanhGaussianActor(
+    observation_space,
+    state_space,
+    action_space,
+    device,
+    hidden_dims=(512, 256),
+    activation=nn.ReLU,
+    log_std_bounds=(-5.0, 2.0),
+)
+models["critic_1"] = Critic(observation_space, state_space, action_space, device)
+models["critic_2"] = Critic(observation_space, state_space, action_space, device)
+models["target_critic_1"] = Critic(observation_space, state_space, action_space, device)
+models["target_critic_2"] = Critic(observation_space, state_space, action_space, device)
 
 
 # configure and instantiate the agent (visit its documentation to see all the options)
@@ -150,15 +119,15 @@ agent = SAC(
     models=models,
     memory=memory,
     cfg=cfg,
-    observation_space=env.observation_space,
-    state_space=env.state_space,
-    action_space=env.action_space,
+    observation_space=observation_space,
+    state_space=state_space,
+    action_space=action_space,
     device=device,
 )
 
 
 # configure and instantiate the RL trainer
-cfg_trainer = {"timesteps": 160000, "headless": args.headless}
+cfg_trainer = {"timesteps": 100000, "headless": args.headless}
 trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=agent)
 
 if args.checkpoint:
