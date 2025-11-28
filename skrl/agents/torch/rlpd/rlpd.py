@@ -444,7 +444,9 @@ class RLPD(Agent):
         return combined, offline_len, online_len
 
     def update(self, *, timestep: int, timesteps: int) -> None:
-        batch, offline_len, online_len = self._prepare_batch()
+        with ScopedTimer() as timer:
+            batch, offline_len, online_len = self._prepare_batch()
+        self.track_data("Stats / Update - 1 Sampling (ms)", timer.elapsed_time_ms)
         if batch is None:
             return
 
@@ -459,6 +461,10 @@ class RLPD(Agent):
         log_prefix: str,
     ) -> None:
         utd = max(1, int(self.cfg.utd_ratio))
+        preprocess_time_ms = 0.0
+        critic_time_ms = 0.0
+        actor_time_ms = 0.0
+        entropy_time_ms = 0.0
 
         def split_opt(x):
             if x is None:
@@ -489,136 +495,151 @@ class RLPD(Agent):
             terminated = terminated_splits[i]
             truncated = truncated_splits[i]
 
-            with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-                inputs = {
-                    "observations": self._observation_preprocessor(obs, train=True),
-                    "states": self._state_preprocessor(states, train=True),
-                }
-                next_inputs = {
-                    "observations": self._observation_preprocessor(next_obs, train=True),
-                    "states": self._state_preprocessor(next_states, train=True),
-                }
+            with ScopedTimer() as prep_timer:
+                with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+                    inputs = {
+                        "observations": self._observation_preprocessor(obs, train=True),
+                        "states": self._state_preprocessor(states, train=True),
+                    }
+                    next_inputs = {
+                        "observations": self._observation_preprocessor(next_obs, train=True),
+                        "states": self._state_preprocessor(next_states, train=True),
+                    }
 
-                with torch.no_grad():
-                    next_actions, out_next = self.policy.act(next_inputs, role="policy")
-                    next_log_prob = out_next["log_prob"]
-                    # debug: detect exploding actions early
-                    if torch.isnan(next_actions).any() or torch.isinf(next_actions).any():
-                        print("[DEBUG][RLPD] next_actions contains NaN/Inf:", next_actions.detach().cpu())
-                    else:
-                        max_abs = next_actions.abs().max().item()
-                        if max_abs > 10.0:
-                            print(f"[DEBUG][RLPD] next_actions abs max is large: {max_abs:.3f}")
+                    with torch.no_grad():
+                        next_actions, out_next = self.policy.act(next_inputs, role="policy")
+                        next_log_prob = out_next["log_prob"]
+                        # debug: detect exploding actions early
+                        if torch.isnan(next_actions).any() or torch.isinf(next_actions).any():
+                            print("[DEBUG][RLPD] next_actions contains NaN/Inf:", next_actions.detach().cpu())
+                        else:
+                            max_abs = next_actions.abs().max().item()
+                            if max_abs > 10.0:
+                                print(f"[DEBUG][RLPD] next_actions abs max is large: {max_abs:.3f}")
 
-                    E = len(self.target_critics)
-                    M = min(self.cfg.num_min_qs, E)
-                    if E <= 0 or M <= 0:
-                        raise ValueError(
-                            f"Empty target ensemble (E={E}, M={M}). Check 'target_critic_i' models. "
-                            f"Models: {sorted(list(self.models.keys()))}"
+                        E = len(self.target_critics)
+                        M = min(self.cfg.num_min_qs, E)
+                        if E <= 0 or M <= 0:
+                            raise ValueError(
+                                f"Empty target ensemble (E={E}, M={M}). Check 'target_critic_i' models. "
+                                f"Models: {sorted(list(self.models.keys()))}"
+                            )
+                        if M < E:
+                            idx = torch.randperm(E, device=next_actions.device)[:M]
+                            chosen_targets = [self.target_critics[j] for j in idx.tolist()]
+                        else:
+                            chosen_targets = self.target_critics
+
+                        target_q_list = []
+                        for j, tc in enumerate(chosen_targets):
+                            qv, _ = tc.act({**next_inputs, "taken_actions": next_actions}, role=f"target_critic_{j}")
+                            target_q_list.append(qv)
+                        target_q_stack = torch.stack(target_q_list, dim=0)
+                        target_q_min, _ = torch.min(target_q_stack, dim=0)
+                        # target_q_values = target_q_min - self._entropy_coefficient * next_log_prob
+                        target_q_values = target_q_min
+                        target_values = (
+                            rews + self.cfg.discount_factor * (terminated | truncated).logical_not() * target_q_values
                         )
-                    if M < E:
-                        idx = torch.randperm(E, device=next_actions.device)[:M]
-                        chosen_targets = [self.target_critics[j] for j in idx.tolist()]
-                    else:
-                        chosen_targets = self.target_critics
 
-                    target_q_list = []
-                    for j, tc in enumerate(chosen_targets):
-                        qv, _ = tc.act({**next_inputs, "taken_actions": next_actions}, role=f"target_critic_{j}")
-                        target_q_list.append(qv)
-                    target_q_stack = torch.stack(target_q_list, dim=0)
-                    target_q_min, _ = torch.min(target_q_stack, dim=0)
-                    # target_q_values = target_q_min - self._entropy_coefficient * next_log_prob
-                    target_q_values = target_q_min
-                    target_values = (
-                        rews + self.cfg.discount_factor * (terminated | truncated).logical_not() * target_q_values
-                    )
+                    q_values = []
+                    for j, c in enumerate(self.critics):
+                        qj, _ = c.act({**inputs, "taken_actions": acts}, role=f"critic_{j}")
+                        q_values.append(qj)
+                        if torch.isnan(qj).any() or torch.isinf(qj).any():
+                            print(f"[DEBUG][RLPD] critic_{j} output has NaN/Inf:", qj.detach().cpu())
+                    q_stack = torch.stack(q_values, dim=0)
+                    critic_loss = F.mse_loss(q_stack, target_values.expand_as(q_stack))
+                    if torch.isnan(critic_loss) or torch.isinf(critic_loss):
+                        print("[DEBUG][RLPD] critic_loss became NaN/Inf. "
+                              "Inspect inputs/targets for instability.")
+            preprocess_time_ms += prep_timer.elapsed_time_ms
 
-                q_values = []
-                for j, c in enumerate(self.critics):
-                    qj, _ = c.act({**inputs, "taken_actions": acts}, role=f"critic_{j}")
-                    q_values.append(qj)
-                    if torch.isnan(qj).any() or torch.isinf(qj).any():
-                        print(f"[DEBUG][RLPD] critic_{j} output has NaN/Inf:", qj.detach().cpu())
-                q_stack = torch.stack(q_values, dim=0)
-                critic_loss = F.mse_loss(q_stack, target_values.expand_as(q_stack))
-                if torch.isnan(critic_loss) or torch.isinf(critic_loss):
-                    print("[DEBUG][RLPD] critic_loss became NaN/Inf. "
-                          "Inspect inputs/targets for instability.")
+            with ScopedTimer() as critic_timer:
+                self.critic_optimizer.zero_grad()
+                self.scaler.scale(critic_loss).backward()
 
-            self.critic_optimizer.zero_grad()
-            self.scaler.scale(critic_loss).backward()
+                if config.torch.is_distributed:
+                    for c in self.critics:
+                        c.reduce_parameters()
 
-            if config.torch.is_distributed:
-                for c in self.critics:
-                    c.reduce_parameters()
+                if self.cfg.grad_norm_clip > 0:
+                    self.scaler.unscale_(self.critic_optimizer)
+                    nn.utils.clip_grad_norm_(itertools.chain(*[c.parameters() for c in self.critics]), self.cfg.grad_norm_clip)
 
-            if self.cfg.grad_norm_clip > 0:
-                self.scaler.unscale_(self.critic_optimizer)
-                nn.utils.clip_grad_norm_(itertools.chain(*[c.parameters() for c in self.critics]), self.cfg.grad_norm_clip)
+                self.scaler.step(self.critic_optimizer)
 
-            self.scaler.step(self.critic_optimizer)
-
-            for c, tc in zip(self.critics, self.target_critics):
-                tc.update_parameters(c, polyak=self.cfg.polyak)
+                for c, tc in zip(self.critics, self.target_critics):
+                    tc.update_parameters(c, polyak=self.cfg.polyak)
+            critic_time_ms += critic_timer.elapsed_time_ms
 
             last_cache = (inputs, q_stack, target_values)
 
         if last_cache is not None:
             inputs, q_stack, target_values = last_cache
-            with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-                actions, outputs = self.policy.act(inputs, role="policy")
-                log_prob = outputs["log_prob"]
-                q_values_pi = []
-                for j, c in enumerate(self.critics):
-                    qj, _ = c.act({**inputs, "taken_actions": actions}, role=f"critic_{j}")
-                    q_values_pi.append(qj)
-                q_pi_stack = torch.stack(q_values_pi, dim=0)
-                q_pi_mean = torch.mean(q_pi_stack, dim=0)
-                policy_loss = (self._entropy_coefficient * log_prob - q_pi_mean).mean()
-                # capture E[log_prob] and E[log_prob + target] for logging next to alpha
-                try:
-                    mean_log_prob = torch.mean(log_prob.detach())
-                    if self.cfg.learn_entropy:
-                        # ensure dtype/device match for numerical stability
-                        _target = torch.as_tensor(self._target_entropy, device=log_prob.device, dtype=log_prob.dtype)
-                        mean_log_prob_plus_target = torch.mean((log_prob + _target).detach())
-                except Exception:
-                    mean_log_prob = None
-                    mean_log_prob_plus_target = None
-                # optional diagnostic: variance incentive from Q wrt action
-                variance_incentive = None
-                try:
-                    if outputs.get("mean_actions", None) is not None:
-                        dqda = torch.autograd.grad(q_pi_mean.mean(), actions, retain_graph=True, create_graph=False)[0]
-                        variance_incentive = (dqda * (actions - outputs["mean_actions"]))
-                        variance_incentive = variance_incentive.sum(dim=-1).mean().detach()
-                except Exception:
-                    variance_incentive = None
-
-            self.policy_optimizer.zero_grad()
-            self.scaler.scale(policy_loss).backward()
-
-            if config.torch.is_distributed:
-                self.policy.reduce_parameters()
-
-            if self.cfg.grad_norm_clip > 0:
-                self.scaler.unscale_(self.policy_optimizer)
-                nn.utils.clip_grad_norm_(self.policy.parameters(), self.cfg.grad_norm_clip)
-
-            self.scaler.step(self.policy_optimizer)
-
-            if self.cfg.learn_entropy:
+            with ScopedTimer() as actor_timer:
                 with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-                    entropy_loss = -(self.log_entropy_coefficient * (log_prob + self._target_entropy).detach()).mean()
-                self.entropy_optimizer.zero_grad()
-                self.scaler.scale(entropy_loss).backward()
-                self.scaler.step(self.entropy_optimizer)
-                self._entropy_coefficient = torch.exp(self.log_entropy_coefficient.detach())
+                    actions, outputs = self.policy.act(inputs, role="policy")
+                    log_prob = outputs["log_prob"]
+                    q_values_pi = []
+                    for j, c in enumerate(self.critics):
+                        qj, _ = c.act({**inputs, "taken_actions": actions}, role=f"critic_{j}")
+                        q_values_pi.append(qj)
+                    q_pi_stack = torch.stack(q_values_pi, dim=0)
+                    q_pi_mean = torch.mean(q_pi_stack, dim=0)
+                    policy_loss = (self._entropy_coefficient * log_prob - q_pi_mean).mean()
+                    # capture E[log_prob] and E[log_prob + target] for logging next to alpha
+                    try:
+                        mean_log_prob = torch.mean(log_prob.detach())
+                        if self.cfg.learn_entropy:
+                            # ensure dtype/device match for numerical stability
+                            _target = torch.as_tensor(self._target_entropy, device=log_prob.device, dtype=log_prob.dtype)
+                            mean_log_prob_plus_target = torch.mean((log_prob + _target).detach())
+                    except Exception:
+                        mean_log_prob = None
+                        mean_log_prob_plus_target = None
+                    # optional diagnostic: variance incentive from Q wrt action
+                    variance_incentive = None
+                    try:
+                        if outputs.get("mean_actions", None) is not None:
+                            dqda = torch.autograd.grad(q_pi_mean.mean(), actions, retain_graph=True, create_graph=False)[0]
+                            variance_incentive = (dqda * (actions - outputs["mean_actions"]))
+                            variance_incentive = variance_incentive.sum(dim=-1).mean().detach()
+                    except Exception:
+                        variance_incentive = None
+
+                self.policy_optimizer.zero_grad()
+                self.scaler.scale(policy_loss).backward()
+
+                if config.torch.is_distributed:
+                    self.policy.reduce_parameters()
+
+                if self.cfg.grad_norm_clip > 0:
+                    self.scaler.unscale_(self.policy_optimizer)
+                    nn.utils.clip_grad_norm_(self.policy.parameters(), self.cfg.grad_norm_clip)
+
+                self.scaler.step(self.policy_optimizer)
+            actor_time_ms += actor_timer.elapsed_time_ms
+
+            entropy_loss = None
+            if self.cfg.learn_entropy:
+                with ScopedTimer() as entropy_timer:
+                    with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+                        entropy_loss = -(self.log_entropy_coefficient * (log_prob + self._target_entropy).detach()).mean()
+                    self.entropy_optimizer.zero_grad()
+                    self.scaler.scale(entropy_loss).backward()
+                    self.scaler.step(self.entropy_optimizer)
+                    self._entropy_coefficient = torch.exp(self.log_entropy_coefficient.detach())
+                entropy_time_ms += entropy_timer.elapsed_time_ms
 
             self.scaler.update()
+        else:
+            entropy_loss = None
 
+        self.track_data("Stats / Update - 2 Preprocess (ms)", preprocess_time_ms)
+        self.track_data("Stats / Update - 3 Critic (ms)", critic_time_ms)
+        self.track_data("Stats / Update - 4 Actor (ms)", actor_time_ms)
+        self.track_data("Stats / Update - 5 Entropy (ms)", entropy_time_ms)
         if self.policy_scheduler:
             self.policy_scheduler.step()
         if self.critic_scheduler:

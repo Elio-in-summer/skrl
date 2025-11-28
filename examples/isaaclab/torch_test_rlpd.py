@@ -24,6 +24,7 @@ WANDB_CONFIG_KEYS = (
     "offline_ratio",
     "offline_pretrain_steps",
 )
+BUFFER_TRANSITION_UPLIMIT = 1000000
 
 
 # parse arguments
@@ -146,7 +147,7 @@ if args.offline_ratio > 0.0 and not args.offline_dataset:
 
 
 # instantiate a replay memory
-BASE_MEMORY_SIZE = 3000
+BASE_MEMORY_SIZE = int(BUFFER_TRANSITION_UPLIMIT / env.num_envs)
 memory_device = device
 memory_size = BASE_MEMORY_SIZE
 
@@ -162,6 +163,8 @@ if args.rollout_dataset:
     memory_size = requested_samples
     memory_device = "cpu"
 
+
+logger.info(f"Memory size: {memory_size}, Memory device: {memory_device}")
 memory = RandomMemory(memory_size=memory_size, num_envs=env.num_envs, device=memory_device)
 
 
@@ -174,7 +177,7 @@ models["policy"] = RLPDTanhGaussianActor(
     device,
     hidden_dims=(512, 256, 128),
     activation=nn.ELU,
-    log_std_bounds=(-5.0, 2.0),
+    log_std_bounds=(-20.0, 2.0), # smaller log_std_bounds allow policy have bigger entropy, high-dim actor needs more entropy
 )
 
 # choose critic implementation and build ensemble
