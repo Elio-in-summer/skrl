@@ -1,7 +1,7 @@
 import argparse
 import os
 from datetime import datetime
-from typing import Optional, cast
+from typing import Any, Callable, Optional, cast
 
 # IMPORTANT: delay importing torch/skrl heavy modules until after SimulationApp
 # is created (via load_isaaclab_env). This avoids GLIBCXX/libstdc++ conflicts
@@ -22,9 +22,11 @@ WANDB_CONFIG_KEYS = (
     "utd_ratio",
     "offline_dataset",
     "offline_ratio",
-    "offline_pretrain_steps",
 )
 BUFFER_TRANSITION_UPLIMIT = 1000000
+HQ_TRAJECTORY_TARGET = 200
+HQ_COMMAND_NAME = "object_pose"
+HQ_METRIC_NAME = "consecutive_success"
 
 
 # parse arguments
@@ -51,7 +53,6 @@ parser.add_argument(
 )
 parser.add_argument("--offline_dataset", type=str, default=None, help="Path to offline dataset (.pt)")
 parser.add_argument("--offline_ratio", type=float, default=0.5, help="Fraction of each batch drawn from offline data")
-parser.add_argument("--offline_pretrain_steps", type=int, default=0, help="Number of offline-only updates before training")
 parser.add_argument("--rollout_dataset", type=str, default=None, help="Save collected transitions to this .pt file (forces eval mode)")
 parser.add_argument(
     "--wandb_run_name",
@@ -65,6 +66,13 @@ parser.add_argument(
     nargs="*",
     default=None,
     help="Optional list of tags for the W&B run",
+)
+parser.add_argument("--hq_traj_enable", action="store_true", help="Enable high-quality trajectory filtering")
+parser.add_argument(
+    "--hq_traj_threshold",
+    type=int,
+    default=10,
+    help="Threshold on consecutive_success used to flag high-quality trajectories",
 )
 
 # load the environment FIRST so that SimulationApp initializes and resolves
@@ -90,29 +98,137 @@ from skrl.trainers.torch import SequentialTrainer
 from skrl.utils import set_seed
 
 
-class Critic(DeterministicMixin, Model):
-    def __init__(self, observation_space, state_space, action_space, device):
-        Model.__init__(
-            self,
-            observation_space=observation_space,
-            state_space=state_space,
-            action_space=action_space,
-            device=device,
-        )
-        DeterministicMixin.__init__(self)
+class HighQualityTrajectoryTargetReached(RuntimeError):
+    """Raised to stop rollout once enough high-quality trajectories are collected."""
 
-        self.net = nn.Sequential(
-            nn.Linear(self.num_observations + self.num_actions, 512),
-            nn.ELU(),
-            nn.Linear(512, 256),
-            nn.ELU(),
-            nn.Linear(256, 128),
-            nn.ELU(),
-            nn.Linear(128, 1),
-        )
 
-    def compute(self, inputs, role):
-        return self.net(torch.cat([inputs["observations"], inputs["taken_actions"]], dim=1)), {}
+class HighQualityTrajectoryCollector:
+    def __init__(
+        self,
+        *,
+        base_env: Any,
+        num_envs: int,
+        threshold: int,
+        target_episodes: Optional[int],
+        command_name: str = HQ_COMMAND_NAME,
+        metric_name: str = HQ_METRIC_NAME,
+        store_episodes: bool = True,
+        episode_callback: Optional[Callable[[dict], None]] = None,
+    ) -> None:
+        self._base_env = base_env
+        self._num_envs = num_envs
+        self._threshold = threshold
+        self._target = target_episodes
+        self._metric_name = metric_name
+        self._command_term = base_env.command_manager.get_term(command_name)
+        metric_tensor = self._command_term.metrics[metric_name]
+        self._success_flags = torch.zeros_like(metric_tensor, dtype=torch.bool)
+        self._trajectories = [[] for _ in range(num_envs)]
+        self._episodes = [] if store_episodes else None
+        self._collected = 0
+        self._episode_callback = episode_callback
+
+    @property
+    def collected(self) -> int:
+        return self._collected
+
+    @property
+    def target(self) -> int:
+        return self._target
+
+    def process_transition(
+        self,
+        *,
+        observations: torch.Tensor,
+        states: Optional[torch.Tensor],
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        next_observations: torch.Tensor,
+        next_states: Optional[torch.Tensor],
+        terminated: torch.Tensor,
+        truncated: torch.Tensor,
+    ) -> bool:
+        with torch.no_grad():
+            metrics = self._command_term.metrics[self._metric_name]
+            self._success_flags |= metrics >= self._threshold
+
+        reached_target = False
+        for env_id in range(self._num_envs):
+            step = {
+                "observations": observations[env_id].detach().clone(),
+                "next_observations": next_observations[env_id].detach().clone(),
+                "actions": actions[env_id].detach().clone(),
+                "rewards": rewards[env_id].detach().clone(),
+                "terminated": terminated[env_id].detach().clone(),
+                "truncated": truncated[env_id].detach().clone(),
+            }
+            if states is not None:
+                step["states"] = states[env_id].detach().clone()
+            if next_states is not None:
+                step["next_states"] = next_states[env_id].detach().clone()
+            self._trajectories[env_id].append(step)
+
+            env_terminated = bool(terminated[env_id].bool().any().item())
+            env_truncated = bool(truncated[env_id].bool().any().item())
+            if env_terminated or env_truncated:
+                reached_target |= self._finalize_env_episode(env_id)
+        return reached_target
+
+    def build_dataset(self) -> dict:
+        if not self._episodes:
+            return {}
+        aggregated = {}
+        for episode in self._episodes:
+            for key, value in episode.items():
+                aggregated.setdefault(key, []).append(value)
+        return {key: torch.cat(value_list, dim=0) for key, value_list in aggregated.items()}
+
+    def _finalize_env_episode(self, env_id: int) -> bool:
+        reached_target = False
+        episode_steps = self._trajectories[env_id]
+        if self._success_flags[env_id].item() and episode_steps:
+            packed = self._pack_episode(episode_steps)
+            if self._episode_callback is not None:
+                self._episode_callback(packed)
+            if self._episodes is not None:
+                self._episodes.append(packed)
+            self._collected += 1
+            if self._target is not None:
+                reached_target = self._collected >= self._target
+        self._trajectories[env_id] = []
+        self._success_flags[env_id] = False
+        return reached_target
+
+    @staticmethod
+    def _pack_episode(steps):
+        episode = {}
+        for step in steps:
+            for key, value in step.items():
+                episode.setdefault(key, []).append(value)
+        return {key: torch.stack(values, dim=0) for key, values in episode.items()}
+
+
+class BoundedOfflineDataset(OfflineDataset):
+    def __init__(self, *args, max_transitions: int = BUFFER_TRANSITION_UPLIMIT, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.max_transitions = max_transitions
+
+    def set_data(self, data: dict) -> None:
+        super().set_data(data)
+        self._enforce_limit()
+
+    def append(self, new_data: dict[str, torch.Tensor], *, inplace: bool = True) -> None:
+        super().append(new_data, inplace=inplace)
+        self._enforce_limit()
+
+    def _enforce_limit(self) -> None:
+        excess = self.length - self.max_transitions
+        if excess <= 0 or not self._data:
+            return
+        for key, value in self._data.items():
+            if value is not None:
+                self._data[key] = value[excess:]
+        self._length = self._data["rewards"].shape[0]
 
 
 # wrap the environment
@@ -121,21 +237,6 @@ observation_space = cast(gym.Space, env.observation_space)
 state_space = cast(Optional[gym.Space], getattr(env, "state_space", None))
 action_space = cast(gym.Space, env.action_space)
 
-# Isaac Lab joint targets expect [-1, 1]; override underlying Box so GaussianMixin can clamp
-try:
-    import numpy as np
-    from gymnasium import spaces
-
-    act_shape = action_space.shape
-    bounded_space = spaces.Box(
-        low=-np.ones(act_shape, dtype=np.float32),
-        high=np.ones(act_shape, dtype=np.float32),
-        dtype=np.float32,
-    )
-    # property returns _unwrapped.single_action_space, so patch that object
-    env.unwrapped.single_action_space = bounded_space
-except Exception as e:
-    logger.warning(f"Failed to override action space bounds: {e}")
 device = env.device
 
 
@@ -158,15 +259,6 @@ memory_device = device
 memory_size = BASE_MEMORY_SIZE
 
 if args.rollout_dataset:
-    requested_samples = env.num_envs * args.timesteps + 1
-    if requested_samples > BASE_MEMORY_SIZE:
-        logger.error(
-            "Rollout request (%d samples) exceeds memory capacity (%d). Reduce timesteps or num_envs.",
-            requested_samples,
-            BASE_MEMORY_SIZE,
-        )
-        exit(1)
-    memory_size = requested_samples
     memory_device = "cpu"
 
 
@@ -202,8 +294,8 @@ def critic_factory():
             activation=nn.ELU,
             layer_norm_affine=args.ln_affine,
         )
-    return Critic(observation_space, state_space, action_space, device)
-
+    else:
+        raise ValueError("Critic Without Layer Normalization is Not Supported！")
 
 E = max(1, int(args.num_qs))
 for i in range(1, E + 1):
@@ -211,10 +303,16 @@ for i in range(1, E + 1):
 for i in range(1, E + 1):
     models[f"target_critic_{i}"] = critic_factory()
 
-offline_dataset = None
+def _create_offline_dataset() -> BoundedOfflineDataset:
+    return BoundedOfflineDataset(device=device, max_transitions=BUFFER_TRANSITION_UPLIMIT)
+
+
+offline_dataset: Optional[BoundedOfflineDataset] = None
 if args.offline_dataset:
-    offline_dataset = OfflineDataset(device=device)
+    offline_dataset = _create_offline_dataset()
     offline_dataset.load(args.offline_dataset)
+elif args.hq_traj_enable and not args.rollout_dataset:
+    offline_dataset = _create_offline_dataset()
 
 
 import wandb
@@ -243,7 +341,6 @@ cfg.num_min_qs = args.num_min_qs
 cfg.utd_ratio = args.utd_ratio
 cfg.env_steps_per_update = args.steps_per_update
 cfg.offline_ratio = args.offline_ratio
-cfg.offline_pretrain_steps = args.offline_pretrain_steps
 
 cfg.state_preprocessor = RunningStandardScaler
 cfg.state_preprocessor_kwargs = {"size": observation_space, "device": device}
@@ -306,6 +403,107 @@ def write_tracking_data_with_wandb(self, *, timestep: int, timesteps: int) -> No
 
 agent.write_tracking_data = MethodType(write_tracking_data_with_wandb, agent)
 
+hq_collector = None
+hq_mode: Optional[str] = None
+hq_stats = {"episodes": 0, "transitions": 0}
+if args.hq_traj_enable:
+    base_env = getattr(env, "_unwrapped", None) or getattr(env, "unwrapped", None) or env
+    try:
+        if args.rollout_dataset:
+            hq_collector = HighQualityTrajectoryCollector(
+                base_env=base_env,
+                num_envs=env.num_envs,
+                threshold=args.hq_traj_threshold,
+                target_episodes=HQ_TRAJECTORY_TARGET,
+            )
+            hq_mode = "rollout"
+            logger.info(
+                "High-quality rollout mode enabled (threshold=%d, target=%d trajectories)",
+                args.hq_traj_threshold,
+                HQ_TRAJECTORY_TARGET,
+            )
+        else:
+            if offline_dataset is None:
+                offline_dataset = _create_offline_dataset()
+            if offline_dataset is None:
+                raise RuntimeError("Failed to initialize offline dataset for HQ collection")
+
+            def _consume_episode(episode: dict) -> None:
+                flat_episode = {key: tensor for key, tensor in episode.items() if tensor is not None}
+                offline_dataset.append(flat_episode)
+                hq_stats["episodes"] += 1
+                step_count = flat_episode["rewards"].shape[0]
+                hq_stats["transitions"] += step_count
+                if hasattr(agent, "track_data"):
+                    agent.track_data("Data / HQ offline trajectories", float(hq_stats["episodes"]))
+                    agent.track_data("Data / HQ offline transitions", float(hq_stats["transitions"]))
+
+            hq_collector = HighQualityTrajectoryCollector(
+                base_env=base_env,
+                num_envs=env.num_envs,
+                threshold=args.hq_traj_threshold,
+                target_episodes=None,
+                store_episodes=False,
+                episode_callback=_consume_episode,
+            )
+            hq_mode = "train"
+            logger.info(
+                "High-quality training mode enabled (threshold=%d, offline budget=%d transitions)",
+                args.hq_traj_threshold,
+                offline_dataset.max_transitions,
+            )
+            if cfg.offline_ratio <= 0:
+                logger.warning("Offline ratio is 0; high-quality trajectories will not be sampled during updates")
+    except Exception as exc:
+        logger.error(f"Failed to initialize high-quality trajectory collector: {exc}")
+        exit(1)
+
+if hq_collector is not None:
+    original_record_transition = agent.record_transition
+
+    def record_transition_with_hq(
+        self,
+        *,
+        observations,
+        states,
+        actions,
+        rewards,
+        next_observations,
+        next_states,
+        terminated,
+        truncated,
+        infos,
+        timestep,
+        timesteps,
+    ):
+        reached_target = hq_collector.process_transition(
+            observations=observations,
+            states=states,
+            actions=actions,
+            rewards=rewards,
+            next_observations=next_observations,
+            next_states=next_states,
+            terminated=terminated,
+            truncated=truncated,
+        )
+        original_record_transition(
+            observations=observations,
+            states=states,
+            actions=actions,
+            rewards=rewards,
+            next_observations=next_observations,
+            next_states=next_states,
+            terminated=terminated,
+            truncated=truncated,
+            infos=infos,
+            timestep=timestep,
+            timesteps=timesteps,
+        )
+        if reached_target and hq_mode == "rollout":
+            raise HighQualityTrajectoryTargetReached
+
+    agent.record_transition = MethodType(record_transition_with_hq, agent)
+
 
 # configure and instantiate the RL trainer
 cfg_trainer = {
@@ -321,36 +519,58 @@ if args.checkpoint:
         exit(1)
     agent.load(args.checkpoint)
 
-if args.offline_pretrain_steps > 0:
-    if offline_dataset is None:
-        logger.error("Offline pretraining requested but no offline dataset provided")
-        exit(1)
-    logger.info(f"Running {args.offline_pretrain_steps} offline pretrain updates")
-    agent.run_offline_updates(args.offline_pretrain_steps)
 
 run_eval = args.eval or bool(args.rollout_dataset)
 if run_eval:
-    trainer.eval()
+    if hq_collector is not None:
+        try:
+            trainer.eval()
+        except HighQualityTrajectoryTargetReached:
+            logger.info(
+                "Collected %d high-quality trajectories (target %d); stopping rollout",
+                hq_collector.collected,
+                hq_collector.target,
+            )
+    else:
+        trainer.eval()
 else:
     trainer.train()
 
 if args.rollout_dataset:
-    num_samples = len(memory)
-    if num_samples == 0:
-        logger.warning("No samples collected; rollout dataset not saved")
+    if hq_collector is not None:
+        dataset = hq_collector.build_dataset()
+        if not dataset:
+            logger.warning("No high-quality trajectories collected; rollout dataset not saved")
+        else:
+            cpu_dataset = {key: value.clone().cpu() for key, value in dataset.items()}
+            sample_count = next(iter(cpu_dataset.values())).shape[0]
+            output_dir = os.path.dirname(args.rollout_dataset)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            torch.save(cpu_dataset, args.rollout_dataset)
+            logger.info(
+                "Saved %d high-quality transitions (%d trajectories) to '%s'",
+                sample_count,
+                hq_collector.collected,
+                args.rollout_dataset,
+            )
     else:
-        dataset = {}
-        for name in agent._tensors_names:
-            tensor_view = memory.tensors_view.get(name)
-            if tensor_view is None:
-                continue
-            tensor = tensor_view[:num_samples]
-            dataset[name] = tensor.clone().cpu()
-        output_dir = os.path.dirname(args.rollout_dataset)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        torch.save(dataset, args.rollout_dataset)
-        logger.info(f"Saved {num_samples} transitions to '{args.rollout_dataset}'")
+        num_samples = len(memory)
+        if num_samples == 0:
+            logger.warning("No samples collected; rollout dataset not saved")
+        else:
+            dataset = {}
+            for name in agent._tensors_names:
+                tensor_view = memory.tensors_view.get(name)
+                if tensor_view is None:
+                    continue
+                tensor = tensor_view[:num_samples]
+                dataset[name] = tensor.clone().cpu()
+            output_dir = os.path.dirname(args.rollout_dataset)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            torch.save(dataset, args.rollout_dataset)
+            logger.info(f"Saved {num_samples} transitions to '{args.rollout_dataset}'")
 
 if wandb_run is not None:
     wandb_run.finish()

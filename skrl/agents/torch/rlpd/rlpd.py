@@ -706,25 +706,3 @@ class RLPD(Agent):
                         float(offline_count) / float(total_samples),
                     )
 
-    def run_offline_updates(self, steps: int, *, batch_size: int | None = None) -> None:
-        if steps <= 0:
-            return
-        if self.offline_dataset is None:
-            logger.warning("Offline pretraining requested but no offline dataset is available")
-            return
-        utd = max(1, int(self.cfg.utd_ratio))
-        total_batch = (batch_size or self.cfg.batch_size) * utd
-        import tqdm
-
-        for _ in tqdm.tqdm(range(steps), desc="Offline pretrain", leave=False):
-            offline_batch = self._sample_offline_batch(total_batch)
-            offline_len = self._batch_size_from_dict(offline_batch)
-            combined = self._combine_batches(None, offline_batch, 0, offline_len)
-            if combined is None:
-                break
-            self._update_from_batch(combined, offline_count=offline_len, online_count=0, log_prefix="Offline Pretrain")
-
-            # log hparams as scalars (cheap) for traceability
-            self.track_data("Ensemble / num_qs", float(len(self.critics)))
-            self.track_data("Ensemble / num_min_qs", float(min(self.cfg.num_min_qs, len(self.critics))))
-            self.track_data("Learning / UTD ratio", float(utd))
