@@ -43,6 +43,12 @@ parser.set_defaults(ln_affine=True)
 parser.add_argument("--num_qs", type=int, default=10, help="Number of critic networks (ensemble size E)")
 parser.add_argument("--num_min_qs", type=int, default=1, help="Number of target critics for min (subset size M)")
 parser.add_argument("--utd_ratio", type=int, default=1, help="Update-to-data ratio (UTD)")
+parser.add_argument(
+    "--steps_per_update",
+    type=int,
+    default=1,
+    help="Number of environment steps to collect before triggering learning updates",
+)
 parser.add_argument("--offline_dataset", type=str, default=None, help="Path to offline dataset (.pt)")
 parser.add_argument("--offline_ratio", type=float, default=0.5, help="Fraction of each batch drawn from offline data")
 parser.add_argument("--offline_pretrain_steps", type=int, default=0, help="Number of offline-only updates before training")
@@ -141,9 +147,9 @@ wandb_run = None
 # seed for reproducibility
 set_seed(args.seed)  # e.g. `set_seed(42)` for fixed seed
 
-if args.offline_ratio > 0.0 and not args.offline_dataset:
-    logger.error("--offline_ratio > 0 requires --offline_dataset")
-    exit(1)
+# if args.offline_ratio > 0.0 and not args.offline_dataset:
+#     logger.error("--offline_ratio > 0 requires --offline_dataset")
+#     exit(1)
 
 
 # instantiate a replay memory
@@ -211,6 +217,14 @@ if args.offline_dataset:
     offline_dataset.load(args.offline_dataset)
 
 
+import wandb
+
+date_prefix = datetime.now().strftime("%Y%m%d")
+run_name_suffix = args.wandb_run_name or ""
+wandb_run_name = (
+    f"{date_prefix}{run_name_suffix}" if run_name_suffix else date_prefix
+)
+
 # configure and instantiate the agent (visit其文档查看所有参数)
 cfg = RLPD_CFG()
 cfg.gradient_steps = args.gradient_steps
@@ -227,6 +241,7 @@ cfg.layer_norm_affine = args.ln_affine
 cfg.num_qs = args.num_qs
 cfg.num_min_qs = args.num_min_qs
 cfg.utd_ratio = args.utd_ratio
+cfg.env_steps_per_update = args.steps_per_update
 cfg.offline_ratio = args.offline_ratio
 cfg.offline_pretrain_steps = args.offline_pretrain_steps
 
@@ -236,6 +251,7 @@ cfg.state_preprocessor_kwargs = {"size": observation_space, "device": device}
 # logging to TensorBoard and write checkpoints (in timesteps)
 cfg.experiment.write_interval = "auto" if not args.eval else 0
 cfg.experiment.checkpoint_interval = "auto" if not args.eval else 0
+cfg.experiment.directory = f"runs/torch/{WANDB_PROJECT_NAME}/{wandb_run_name}"
 
 
 agent = RLPD(
@@ -247,15 +263,6 @@ agent = RLPD(
     action_space=action_space,
     device=device,
     offline_dataset=offline_dataset,
-)
-
-
-import wandb
-
-date_prefix = datetime.now().strftime("%Y%m%d")
-run_name_suffix = args.wandb_run_name or ""
-wandb_run_name = (
-    f"{date_prefix}{run_name_suffix}" if run_name_suffix else date_prefix
 )
 
 tags = args.wandb_tags or None
@@ -282,7 +289,6 @@ wandb_run = wandb.init(
     tags=tags,
 )
 
-cfg.experiment.directory = f"runs/torch/{WANDB_PROJECT_NAME}/{wandb_run_name}"
 original_write_tracking_data = agent.write_tracking_data
 
 

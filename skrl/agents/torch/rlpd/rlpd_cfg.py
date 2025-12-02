@@ -131,6 +131,9 @@ class RLPD_CFG(AgentCfg):
     utd_ratio: int = 1
     """Update-to-data ratio (slice a large batch into this many mini-batches; update critics UTD times, actor once)."""
 
+    env_steps_per_update: int = 1
+    """Number of environment steps to collect before triggering an update (>= 1)."""
+
     offline_ratio: float = 0.0
     """Fraction of each training batch sourced from offline data (D buffer)."""
 

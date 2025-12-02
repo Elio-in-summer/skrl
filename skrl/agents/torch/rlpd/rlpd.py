@@ -116,6 +116,8 @@ class RLPD(Agent):
         self._offline_ratio = float(self.cfg.offline_ratio)
         self._offline_mix_mode = self.cfg.offline_mix_mode.lower()
         self._warned_offline_missing = False
+        self._env_steps_per_update = max(1, int(self.cfg.env_steps_per_update))
+        self._steps_since_update = 0
 
         # broadcast models' parameters in distributed runs
         if config.torch.is_distributed:
@@ -329,12 +331,21 @@ class RLPD(Agent):
         :param timestep: Current timestep.
         :param timesteps: Number of timesteps.
         """
+        self._steps_since_update += 1
+
+        should_update = False
         if timestep >= self.cfg.learning_starts:
+            if self._steps_since_update >= self._env_steps_per_update:
+                should_update = True
+
+        if should_update:
             with ScopedTimer() as timer:
                 self.enable_models_training_mode(True)
                 self.update(timestep=timestep, timesteps=timesteps)
                 self.enable_models_training_mode(False)
                 self.track_data("Stats / Algorithm update time (ms)", timer.elapsed_time_ms)
+                self.track_data("Learning / Env steps per update", float(self._env_steps_per_update))
+            self._steps_since_update = 0
 
         # write tracking data and checkpoints
         super().post_interaction(timestep=timestep, timesteps=timesteps)
