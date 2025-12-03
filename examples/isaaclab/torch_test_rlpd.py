@@ -81,6 +81,7 @@ task_name = "Isaac-Repose-Cube-Allegro-v0"
 env = load_isaaclab_env(task_name=task_name, parser=parser, num_envs=64)
 
 # Now import torch/skrl heavy modules safely after SimulationApp is alive
+import numpy as np
 import torch
 import torch.nn as nn
 from types import MethodType
@@ -233,10 +234,22 @@ class BoundedOfflineDataset(OfflineDataset):
 
 # wrap the environment
 env = wrap_env(env)
+
+# Normalize action space to [-1, 1] before exposing it to the agent
+act_shape = env.action_space.shape
+bounded_space = gym.spaces.Box(
+    low=-np.ones(act_shape, dtype=np.float32),
+    high=np.ones(act_shape, dtype=np.float32),
+    dtype=np.float32,
+)
+env.unwrapped.single_action_space = bounded_space
+
 observation_space = cast(gym.Space, env.observation_space)
 state_space = cast(Optional[gym.Space], getattr(env, "state_space", None))
 action_space = cast(gym.Space, env.action_space)
-
+logger.info(f"Action space: {action_space}")
+logger.info(f"Observation space: {observation_space}")
+logger.info(f"State space: {state_space}")
 device = env.device
 
 

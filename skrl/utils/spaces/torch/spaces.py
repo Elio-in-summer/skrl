@@ -386,29 +386,29 @@ def sample_space(
     # fundamental spaces
     # - Box
     if isinstance(space, spaces.Box):
-        sample = gymnasium.vector.utils.batch_space(space, batch_size).sample()
+        stacked = np.stack([space.sample() for _ in range(batch_size)], axis=0)
         if backend == "numpy":
-            return np.array(sample).reshape(batch_size, *space.shape)
+            return stacked.reshape(batch_size, *space.shape)
         elif backend == "native":
-            return torch.tensor(sample, device=device).reshape(batch_size, *space.shape)
+            return torch.tensor(stacked, device=device).reshape(batch_size, *space.shape)
         else:
             raise ValueError(f"Unsupported backend type ({backend})")
     # - Discrete
     elif isinstance(space, spaces.Discrete):
-        sample = gymnasium.vector.utils.batch_space(space, batch_size).sample()
+        stacked = np.stack([space.sample() for _ in range(batch_size)], axis=0)
         if backend == "numpy":
-            return np.array(sample).reshape(batch_size, -1)
+            return stacked.reshape(batch_size, -1)
         elif backend == "native":
-            return torch.tensor(sample, device=device).reshape(batch_size, -1)
+            return torch.tensor(stacked, device=device).reshape(batch_size, -1)
         else:
             raise ValueError(f"Unsupported backend type ({backend})")
     # - MultiDiscrete
     elif isinstance(space, spaces.MultiDiscrete):
-        sample = gymnasium.vector.utils.batch_space(space, batch_size).sample()
+        stacked = np.stack([space.sample() for _ in range(batch_size)], axis=0)
         if backend == "numpy":
-            return np.array(sample).reshape(batch_size, *space.nvec.shape)
+            return stacked.reshape(batch_size, *space.nvec.shape)
         elif backend == "native":
-            return torch.tensor(sample, device=device).reshape(batch_size, *space.nvec.shape)
+            return torch.tensor(stacked, device=device).reshape(batch_size, *space.nvec.shape)
         else:
             raise ValueError(f"Unsupported backend type ({backend})")
     # composite spaces
