@@ -255,8 +255,10 @@ device = env.device
 
 # defer parsing of arguments to include loader arguments (run with --help to see all the arguments)
 args, _ = parser.parse_known_args()
+run_eval = args.eval or bool(args.rollout_dataset)
 
 wandb_run = None
+enable_wandb = not run_eval
 
 # seed for reproducibility
 set_seed(args.seed)  # e.g. `set_seed(42)` for fixed seed
@@ -327,9 +329,6 @@ if args.offline_dataset:
 elif args.hq_traj_enable and not args.rollout_dataset:
     offline_dataset = _create_offline_dataset()
 
-
-import wandb
-
 date_prefix = datetime.now().strftime("%Y%m%d")
 run_name_suffix = args.wandb_run_name or ""
 wandb_run_name = (
@@ -382,39 +381,43 @@ if tags:
     if not tags:
         tags = None
 
-wandb_config = {key: getattr(args, key, None) for key in WANDB_CONFIG_KEYS}
-wandb_config["num_envs"] = env.num_envs
-state_preprocessor = getattr(
-    cfg.state_preprocessor,
-    "__name__",
-    str(cfg.state_preprocessor),
-)
-wandb_config["state_preprocessor"] = state_preprocessor
+if enable_wandb:
+    import wandb
 
-wandb_run = wandb.init(
-    project=WANDB_PROJECT_NAME,
-    entity=WANDB_ENTITY_NAME,
-    name=wandb_run_name,
-    config=wandb_config,
-    tags=tags,
-)
+    wandb_config = {key: getattr(args, key, None) for key in WANDB_CONFIG_KEYS}
+    wandb_config["num_envs"] = env.num_envs
+    state_preprocessor = getattr(
+        cfg.state_preprocessor,
+        "__name__",
+        str(cfg.state_preprocessor),
+    )
+    wandb_config["state_preprocessor"] = state_preprocessor
 
-original_write_tracking_data = agent.write_tracking_data
+    wandb_run = wandb.init(
+        project=WANDB_PROJECT_NAME,
+        entity=WANDB_ENTITY_NAME,
+        name=wandb_run_name,
+        config=wandb_config,
+        tags=tags,
+    )
+    if wandb_run is None:
+        raise RuntimeError("Failed to initialize Weights & Biases run")
+    wandb_session = wandb_run
 
+    original_write_tracking_data = agent.write_tracking_data
 
-def write_tracking_data_with_wandb(self, *, timestep: int, timesteps: int) -> None:
-    if self.tracking_data:
-        metrics = {}
-        for key, values in self.tracking_data.items():
-            if values:
-                metrics[key] = sum(values) / len(values)
-        if metrics:
-            metrics.setdefault("timestep", timestep)
-            wandb_run.log(metrics, step=timestep)
-    original_write_tracking_data(timestep=timestep, timesteps=timesteps)
+    def write_tracking_data_with_wandb(self, *, timestep: int, timesteps: int) -> None:
+        if self.tracking_data:
+            metrics = {}
+            for key, values in self.tracking_data.items():
+                if values:
+                    metrics[key] = sum(values) / len(values)
+            if metrics:
+                metrics.setdefault("timestep", timestep)
+                wandb_session.log(metrics, step=timestep)
+        original_write_tracking_data(timestep=timestep, timesteps=timesteps)
 
-
-agent.write_tracking_data = MethodType(write_tracking_data_with_wandb, agent)
+    agent.write_tracking_data = MethodType(write_tracking_data_with_wandb, agent)
 
 hq_collector = None
 hq_mode: Optional[str] = None
@@ -531,9 +534,6 @@ if args.checkpoint:
         logger.error(f"Checkpoint file not found: '{args.checkpoint}'")
         exit(1)
     agent.load(args.checkpoint)
-
-
-run_eval = args.eval or bool(args.rollout_dataset)
 if run_eval:
     if hq_collector is not None:
         try:
