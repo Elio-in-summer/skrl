@@ -1,5 +1,10 @@
 import argparse
+import json
 import os
+import queue
+import sys
+import threading
+import time
 from datetime import datetime
 from typing import Any, Callable, Optional, cast
 
@@ -24,7 +29,7 @@ WANDB_CONFIG_KEYS = (
     "offline_ratio",
 )
 BUFFER_TRANSITION_UPLIMIT = 1000000
-HQ_TRAJECTORY_TARGET = 200
+HQ_TRAJECTORY_TARGET = 10
 HQ_COMMAND_NAME = "object_pose"
 HQ_METRIC_NAME = "consecutive_success"
 
@@ -71,9 +76,10 @@ parser.add_argument("--hq_traj_enable", action="store_true", help="Enable high-q
 parser.add_argument(
     "--hq_traj_threshold",
     type=int,
-    default=10,
+    default=1,
     help="Threshold on consecutive_success used to flag high-quality trajectories",
 )
+parser.add_argument("--real_time", action="store_true", help="Match simulation speed to wall-clock time during eval/rollout")
 
 # load the environment FIRST so that SimulationApp initializes and resolves
 # runtime libraries before importing torch/skrl heavy modules.
@@ -88,7 +94,7 @@ from types import MethodType
 
 import gymnasium as gym
 from skrl.datasets import OfflineDataset
-from skrl.envs.wrappers.torch import wrap_env
+from skrl.envs.wrappers.torch import Wrapper, wrap_env
 from skrl.memories.torch import RandomMemory
 from skrl.models.torch import DeterministicMixin, Model
 from skrl.models.torch.rlpd_actor import RLPDTanhGaussianActor
@@ -96,8 +102,224 @@ from skrl.models.torch.mlp_ln import RLPDStateActionCritic
 from skrl.agents.torch.rlpd import RLPD, RLPD_CFG
 from skrl.resources.preprocessors.torch import RunningStandardScaler
 from skrl.trainers.torch import SequentialTrainer
+from skrl.trainers.torch.shared_autonomy_sequential import SharedAutonomySequentialTrainer
 from skrl.utils import set_seed
 
+try:
+    import zmq
+except Exception:
+    zmq = None
+
+DEFAULT_ZMQ_ENDPOINT = os.environ.get("ALLEGRO_ZMQ_ENDPOINT", "tcp://127.0.0.1:5556")
+ISAAC_JOINT_SEQUENCE = [
+    "index_joint_0",
+    "middle_joint_0",
+    "ring_joint_0",
+    "thumb_joint_0",
+    "index_joint_1",
+    "middle_joint_1",
+    "ring_joint_1",
+    "thumb_joint_1",
+    "index_joint_2",
+    "middle_joint_2",
+    "ring_joint_2",
+    "thumb_joint_2",
+    "index_joint_3",
+    "middle_joint_3",
+    "ring_joint_3",
+    "thumb_joint_3",
+]
+URDF_TO_ISAAC = {
+    "joint_0.0": "index_joint_0",
+    "joint_1.0": "index_joint_1",
+    "joint_2.0": "index_joint_2",
+    "joint_3.0": "index_joint_3",
+    "joint_4.0": "middle_joint_0",
+    "joint_5.0": "middle_joint_1",
+    "joint_6.0": "middle_joint_2",
+    "joint_7.0": "middle_joint_3",
+    "joint_8.0": "ring_joint_0",
+    "joint_9.0": "ring_joint_1",
+    "joint_10.0": "ring_joint_2",
+    "joint_11.0": "ring_joint_3",
+    "joint_12.0": "thumb_joint_0",
+    "joint_13.0": "thumb_joint_1",
+    "joint_14.0": "thumb_joint_2",
+    "joint_15.0": "thumb_joint_3",
+}
+
+
+class ModeController:
+    def __init__(self) -> None:
+        self.mode = "autonomous"
+        self._queue: "queue.Queue[str]" = queue.Queue()
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def _reader(self) -> None:
+        while True:
+            try:
+                ch = sys.stdin.read(1)
+            except Exception:
+                break
+            if not ch:
+                break
+            self._queue.put(ch.lower())
+
+    def poll(self) -> bool:
+        changed = False
+        while True:
+            try:
+                key = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if key == "w" and self.mode != "external":
+                self.mode = "external"
+                changed = True
+            elif key == "s" and self.mode != "autonomous":
+                self.mode = "autonomous"
+                changed = True
+        return changed
+
+
+class ZMQCommandListener:
+    def __init__(self, endpoint: str = DEFAULT_ZMQ_ENDPOINT, side: str = "right") -> None:
+        self.endpoint = endpoint
+        self.side = side.lower()
+        self.ready = zmq is not None and bool(self.endpoint)
+        self._latest: tuple[list[str], list[float], float] | None = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        if self.ready:
+            self._thread = threading.Thread(target=self._worker, daemon=True)
+            self._thread.start()
+        else:
+            print("[WARN]: ZMQ unavailable or endpoint missing; external takeover disabled")
+
+    def _worker(self) -> None:
+        assert zmq is not None
+        ctx = zmq.Context.instance()
+        socket = ctx.socket(zmq.SUB)
+        socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        try:
+            socket.connect(self.endpoint)
+        except Exception as exc:
+            print(f"[WARN]: Failed to connect to ZMQ endpoint {self.endpoint}: {exc}")
+            self.ready = False
+            socket.close(0)
+            return
+
+        poller = zmq.Poller()
+        poller.register(socket, zmq.POLLIN)
+        while not self._stop.is_set():
+            events = dict(poller.poll(100))
+            if socket in events:
+                try:
+                    raw = socket.recv_string(zmq.NOBLOCK)
+                except zmq.Again:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("side", "").lower() != self.side:
+                    continue
+                names = payload.get("name", [])
+                values = payload.get("normalized_position", [])
+                if len(names) != len(values):
+                    continue
+                with self._lock:
+                    self._latest = (list(names), [float(v) for v in values], float(payload.get("timestamp", time.time())))
+        socket.close(0)
+
+    def get_latest(self) -> tuple[list[str], list[float], float] | None:
+        with self._lock:
+            if self._latest is None:
+                return None
+            names, values, ts = self._latest
+            return (list(names), list(values), ts)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+
+
+class ExternalActionProcessor:
+    def __init__(self, env: Wrapper) -> None:
+        action_shape = cast(tuple, env.action_space.shape)
+        self.action_dim = action_shape[0]
+        self.num_envs = env.num_envs
+        self.device = env.device
+        self.template = torch.zeros(self.num_envs, self.action_dim, device=self.device)
+        self.index_map = {name: idx for idx, name in enumerate(ISAAC_JOINT_SEQUENCE)}
+
+    def convert(self, payload: tuple[list[str], list[float], float] | None) -> torch.Tensor | None:
+        if payload is None:
+            return None
+        names, values, _ = payload
+        result = self.template.clone()
+        filled = False
+        for name, value in zip(names, values):
+            isaac_name = URDF_TO_ISAAC.get(name, name)
+            idx = self.index_map.get(isaac_name)
+            if idx is None or idx >= self.action_dim:
+                continue
+            norm_val = max(-1.0, min(1.0, float(value)))
+            result[:, idx] = norm_val
+            filled = True
+        return result if filled else None
+
+
+class SharedAutonomyController:
+    def __init__(self, trainer: SharedAutonomySequentialTrainer, env: Wrapper) -> None:
+        self.trainer = trainer
+        self.listener = ZMQCommandListener()
+        self.mode_controller = ModeController()
+        self.processor = ExternalActionProcessor(env)
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.last_action: torch.Tensor | None = None
+
+    def start(self) -> None:
+        self.thread.start()
+        self._print_mode()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.listener.stop()
+        if self.thread.is_alive():
+            self.thread.join(timeout=0.5)
+        print()
+
+    def _print_mode(self) -> None:
+        label = "External (ZMQ)" if self.mode_controller.mode == "external" else "Autonomous"
+        print(f"\r[MODE] {label:<20}", end="", flush=True)
+
+    def _loop(self) -> None:
+        while not self.stop_event.is_set():
+            if self.mode_controller.poll():
+                self._print_mode()
+                if self.mode_controller.mode == "autonomous":
+                    self.trainer.end_human_intervene()
+
+            if self.mode_controller.mode == "external" and self.listener.ready:
+                payload = self.listener.get_latest()
+                tensor = self.processor.convert(payload)
+                if tensor is not None:
+                    self.last_action = tensor
+                    self.trainer.update_external_action(tensor)
+                    self.trainer.activate_human_intervene()
+                elif self.last_action is not None:
+                    self.trainer.update_external_action(self.last_action)
+                    self.trainer.activate_human_intervene()
+                else:
+                    self.trainer.end_human_intervene()
+            else:
+                self.trainer.end_human_intervene()
+
+            time.sleep(0.05)
 
 class HighQualityTrajectoryTargetReached(RuntimeError):
     """Raised to stop rollout once enough high-quality trajectories are collected."""
@@ -194,6 +416,7 @@ class HighQualityTrajectoryCollector:
             if self._episodes is not None:
                 self._episodes.append(packed)
             self._collected += 1
+            logger.info(f"High-quality trajectory collected: {self._collected}")
             if self._target is not None:
                 reached_target = self._collected >= self._target
         self._trajectories[env_id] = []
@@ -259,6 +482,10 @@ run_eval = args.eval or bool(args.rollout_dataset)
 
 wandb_run = None
 enable_wandb = not run_eval
+
+if args.real_time and not run_eval:
+    logger.error("--real_time is only supported in evaluation or rollout modes")
+    exit(1)
 
 # seed for reproducibility
 set_seed(args.seed)  # e.g. `set_seed(42)` for fixed seed
@@ -527,25 +754,39 @@ cfg_trainer = {
     "headless": args.headless,
     "disable_progressbar": (args.eval or args.no_pbar),
 }
-trainer = SequentialTrainer(cfg=cfg_trainer, env=env, agents=agent)
+trainer_cls = SharedAutonomySequentialTrainer if run_eval else SequentialTrainer
+trainer_kwargs = {}
+if run_eval and trainer_cls is SharedAutonomySequentialTrainer:
+    trainer_kwargs["real_time"] = bool(args.real_time)
+    step_dt = getattr(env, "step_dt", None)
+    if step_dt is None:
+        step_dt = getattr(getattr(env, "unwrapped", None), "step_dt", None)
+    trainer_kwargs["real_time_dt"] = step_dt
+trainer = trainer_cls(cfg=cfg_trainer, env=env, agents=agent, **trainer_kwargs)
 
 if args.checkpoint:
     if not os.path.exists(args.checkpoint):
         logger.error(f"Checkpoint file not found: '{args.checkpoint}'")
         exit(1)
     agent.load(args.checkpoint)
+shared_controller = None
 if run_eval:
-    if hq_collector is not None:
-        try:
+    shared_controller = SharedAutonomyController(trainer, env)
+    shared_controller.start()
+    try:
+        if hq_collector is not None:
+            try:
+                trainer.eval()
+            except HighQualityTrajectoryTargetReached:
+                logger.info(
+                    "Collected %d high-quality trajectories (target %d); stopping rollout",
+                    hq_collector.collected,
+                    hq_collector.target,
+                )
+        else:
             trainer.eval()
-        except HighQualityTrajectoryTargetReached:
-            logger.info(
-                "Collected %d high-quality trajectories (target %d); stopping rollout",
-                hq_collector.collected,
-                hq_collector.target,
-            )
-    else:
-        trainer.eval()
+    finally:
+        shared_controller.stop()
 else:
     trainer.train()
 
