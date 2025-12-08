@@ -79,6 +79,12 @@ parser.add_argument(
     default=1,
     help="Threshold on consecutive_success used to flag high-quality trajectories",
 )
+parser.add_argument(
+    "--hq_traj_increment_every",
+    type=int,
+    default=HQ_TRAJECTORY_TARGET,
+    help="Number of HQ trajectories to collect before raising the threshold during training (set 0 to disable)",
+)
 parser.add_argument("--real_time", action="store_true", help="Match simulation speed to wall-clock time during eval/rollout")
 
 # load the environment FIRST so that SimulationApp initializes and resolves
@@ -340,7 +346,7 @@ class HighQualityTrajectoryCollector:
     ) -> None:
         self._base_env = base_env
         self._num_envs = num_envs
-        self._threshold = threshold
+        self._threshold = int(threshold)
         self._target = target_episodes
         self._metric_name = metric_name
         self._command_term = base_env.command_manager.get_term(command_name)
@@ -358,6 +364,21 @@ class HighQualityTrajectoryCollector:
     @property
     def target(self) -> int:
         return self._target
+
+    @property
+    def threshold(self) -> int:
+        return int(self._threshold)
+
+    def set_threshold(self, value: int) -> int:
+        new_value = max(0, int(value))
+        if new_value == self._threshold:
+            return self._threshold
+        self._threshold = new_value
+        self._success_flags.zero_()
+        return self._threshold
+
+    def increment_threshold(self, delta: int = 1) -> int:
+        return self.set_threshold(self._threshold + int(delta))
 
     def process_transition(
         self,
@@ -416,7 +437,7 @@ class HighQualityTrajectoryCollector:
             if self._episodes is not None:
                 self._episodes.append(packed)
             self._collected += 1
-            logger.info(f"High-quality trajectory collected: {self._collected}")
+            # logger.info(f"High-quality trajectory collected: {self._collected}")
             if self._target is not None:
                 reached_target = self._collected >= self._target
         self._trajectories[env_id] = []
@@ -671,6 +692,22 @@ if args.hq_traj_enable:
             if offline_dataset is None:
                 raise RuntimeError("Failed to initialize offline dataset for HQ collection")
 
+            threshold_increment_every = max(0, int(args.hq_traj_increment_every))
+
+            def _maybe_raise_threshold() -> None:
+                if threshold_increment_every <= 0 or hq_collector is None:
+                    return
+                if hq_stats["episodes"] == 0 or (hq_stats["episodes"] % threshold_increment_every) != 0:
+                    return
+                new_threshold = hq_collector.increment_threshold()
+                logger.info(
+                    "Raised HQ trajectory threshold to %d after collecting %d high-quality episodes",
+                    new_threshold,
+                    hq_stats["episodes"],
+                )
+                if hasattr(agent, "track_data"):
+                    agent.track_data("Data / HQ threshold", float(new_threshold))
+
             def _consume_episode(episode: dict) -> None:
                 flat_episode = {key: tensor for key, tensor in episode.items() if tensor is not None}
                 offline_dataset.append(flat_episode)
@@ -680,6 +717,7 @@ if args.hq_traj_enable:
                 if hasattr(agent, "track_data"):
                     agent.track_data("Data / HQ offline trajectories", float(hq_stats["episodes"]))
                     agent.track_data("Data / HQ offline transitions", float(hq_stats["transitions"]))
+                _maybe_raise_threshold()
 
             hq_collector = HighQualityTrajectoryCollector(
                 base_env=base_env,
@@ -695,6 +733,11 @@ if args.hq_traj_enable:
                 args.hq_traj_threshold,
                 offline_dataset.max_transitions,
             )
+            if threshold_increment_every > 0:
+                logger.info(
+                    "HQ trajectory threshold will increase by 1 every %d collected high-quality episodes",
+                    threshold_increment_every,
+                )
             if cfg.offline_ratio <= 0:
                 logger.warning("Offline ratio is 0; high-quality trajectories will not be sampled during updates")
     except Exception as exc:
