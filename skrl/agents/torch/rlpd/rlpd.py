@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List
+from typing import Any, List, Optional
 
 import itertools
 import gymnasium
@@ -34,6 +34,7 @@ class RLPD(Agent):
         device: str | torch.device | None = None,
         cfg: RLPD_CFG | dict = {},
         offline_dataset: OfflineDataset | None = None,
+        il_policy: Model | None = None,
     ) -> None:
         """RLPD (initial version: identical to SAC behavior).
 
@@ -61,6 +62,7 @@ class RLPD(Agent):
             cfg=RLPD_CFG(**cfg) if isinstance(cfg, dict) else cfg,
         )
         self.offline_dataset = offline_dataset
+        self.il_policy: Optional[Model] = il_policy
 
         # models
         self.policy = self.models.get("policy", None)
@@ -118,6 +120,18 @@ class RLPD(Agent):
         self._warned_offline_missing = False
         self._env_steps_per_update = max(1, int(self.cfg.env_steps_per_update))
         self._steps_since_update = 0
+        self._proposal_beta = float(self.cfg.proposal_softmax_beta)
+        if not self.cfg.enable_proposal:
+            self.il_policy = None
+        else:
+            if self.il_policy is None:
+                raise ValueError("enable_proposal=True requires an IL policy instance")
+            self.il_policy.to(self.device)
+            self.il_policy.eval()
+            for param in self.il_policy.parameters():
+                param.requires_grad_(False)
+        self._actor_il_fraction = 0.0
+        self._bootstrap_il_fraction = 0.0
 
         # broadcast models' parameters in distributed runs
         if config.torch.is_distributed:
@@ -247,13 +261,13 @@ class RLPD(Agent):
             "states": self._state_preprocessor(states),
         }
         # sample random actions
-        # TODO, check for stochasticity
         if timestep < self.cfg.random_timesteps:
             return self.policy.random_act(inputs, role="policy")
 
-        # sample stochastic actions
         with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
             actions, outputs = self.policy.act(inputs, role="policy")
+            if self._should_use_proposals():
+                actions = self._apply_actor_proposal(inputs, actions)
 
         return actions, outputs
 
@@ -436,6 +450,102 @@ class RLPD(Agent):
 
         return combined
 
+
+    def _should_use_proposals(self) -> bool:
+        return self.cfg.enable_proposal and self.il_policy is not None and len(self.target_critics) > 0
+
+    def _select_target_subset(self) -> List[Model]:
+        E = len(self.target_critics)
+        M = min(self.cfg.num_min_qs, E)
+        if E <= 0 or M <= 0:
+            raise ValueError(
+                f"Empty target ensemble (E={E}, M={M}). Check 'target_critic_i' models. "
+                f"Models: {sorted(list(self.models.keys()))}"
+            )
+        if M < E:
+            idx = torch.randperm(E)[:M].tolist()
+        else:
+            idx = list(range(E))
+        return [self.target_critics[i] for i in idx]
+
+    def _compute_target_q_min(
+        self,
+        critics_subset: List[Model],
+        inputs: dict[str, torch.Tensor | None],
+        actions: torch.Tensor,
+    ) -> torch.Tensor:
+        if not critics_subset:
+            raise ValueError("No critics available for proposal computation")
+        q_values = []
+        data = {
+            "observations": inputs["observations"],
+            "states": inputs.get("states"),
+            "taken_actions": actions,
+        }
+        for j, critic in enumerate(critics_subset):
+            qv, _ = critic.act(data, role=f"target_critic_{j}")
+            q_values.append(qv)
+        q_stack = torch.stack(q_values, dim=0)
+        q_min, _ = torch.min(q_stack, dim=0)
+        return q_min
+
+    def _compute_il_actions(self, inputs: dict[str, torch.Tensor | None]) -> Optional[torch.Tensor]:
+        if self.il_policy is None:
+            return None
+        il_inputs = {
+            "observations": inputs["observations"],
+            "states": inputs.get("states"),
+        }
+        mean, _ = self.il_policy.compute(il_inputs, role="il_policy")
+        il_actions = torch.tanh(mean)
+        return self.il_policy._scale_action(il_actions)
+
+    def _apply_actor_proposal(self, inputs: dict[str, torch.Tensor | None], rl_actions: torch.Tensor) -> torch.Tensor:
+        if not self._should_use_proposals():
+            return rl_actions
+        with torch.no_grad():
+            il_actions = self._compute_il_actions(inputs)
+            if il_actions is None:
+                return rl_actions
+            subset_targets = self._select_target_subset()
+            q_rl = self._compute_target_q_min(subset_targets, inputs, rl_actions)
+            q_il = self._compute_target_q_min(subset_targets, inputs, il_actions)
+            selected_actions, il_mask = self._softmax_select_actions(rl_actions, il_actions, q_rl, q_il)
+            if il_mask.numel() > 0:
+                self._actor_il_fraction = float(il_mask.float().mean().detach().cpu())
+            return selected_actions
+
+    def _softmax_select_actions(
+        self,
+        rl_actions: torch.Tensor,
+        il_actions: torch.Tensor,
+        q_rl: torch.Tensor,
+        q_il: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = torch.cat([q_il, q_rl], dim=1) * self._proposal_beta
+        probs = torch.softmax(logits, dim=1)
+        choices = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        il_mask = choices == 0
+        selected = torch.where(il_mask.unsqueeze(-1), il_actions, rl_actions)
+        return selected, il_mask
+
+    def _sample_bootstrap_q(
+        self,
+        critics_subset: List[Model],
+        inputs: dict[str, torch.Tensor | None],
+        il_actions: torch.Tensor,
+        rl_actions: torch.Tensor,
+    ) -> torch.Tensor:
+        q_il = self._compute_target_q_min(critics_subset, inputs, il_actions)
+        q_rl = self._compute_target_q_min(critics_subset, inputs, rl_actions)
+        logits = torch.cat([q_il, q_rl], dim=1) * self._proposal_beta
+        probs = torch.softmax(logits, dim=1)
+        choices = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        il_mask = choices == 0
+        if probs.numel() > 0:
+            self._bootstrap_il_fraction = float(probs[:, 0].mean().detach().cpu())
+        return torch.where(il_mask.unsqueeze(-1), q_il, q_rl)
+
     def _prepare_batch(self) -> tuple[dict[str, torch.Tensor | None] | None, int, int]:
         utd = max(1, int(self.cfg.utd_ratio))
         total_batch = self.cfg.batch_size * utd
@@ -520,7 +630,6 @@ class RLPD(Agent):
                     with torch.no_grad():
                         next_actions, out_next = self.policy.act(next_inputs, role="policy")
                         next_log_prob = out_next["log_prob"]
-                        # debug: detect exploding actions early
                         if torch.isnan(next_actions).any() or torch.isinf(next_actions).any():
                             print("[DEBUG][RLPD] next_actions contains NaN/Inf:", next_actions.detach().cpu())
                         else:
@@ -528,27 +637,15 @@ class RLPD(Agent):
                             if max_abs > 10.0:
                                 print(f"[DEBUG][RLPD] next_actions abs max is large: {max_abs:.3f}")
 
-                        E = len(self.target_critics)
-                        M = min(self.cfg.num_min_qs, E)
-                        if E <= 0 or M <= 0:
-                            raise ValueError(
-                                f"Empty target ensemble (E={E}, M={M}). Check 'target_critic_i' models. "
-                                f"Models: {sorted(list(self.models.keys()))}"
-                            )
-                        if M < E:
-                            idx = torch.randperm(E, device=next_actions.device)[:M]
-                            chosen_targets = [self.target_critics[j] for j in idx.tolist()]
-                        else:
-                            chosen_targets = self.target_critics
-
-                        target_q_list = []
-                        for j, tc in enumerate(chosen_targets):
-                            qv, _ = tc.act({**next_inputs, "taken_actions": next_actions}, role=f"target_critic_{j}")
-                            target_q_list.append(qv)
-                        target_q_stack = torch.stack(target_q_list, dim=0)
-                        target_q_min, _ = torch.min(target_q_stack, dim=0)
-                        # target_q_values = target_q_min - self._entropy_coefficient * next_log_prob
+                        subset_targets = self._select_target_subset()
+                        target_q_min = self._compute_target_q_min(subset_targets, next_inputs, next_actions)
                         target_q_values = target_q_min
+                        if self._should_use_proposals():
+                            il_next_actions = self._compute_il_actions(next_inputs)
+                            if il_next_actions is not None:
+                                target_q_values = self._sample_bootstrap_q(
+                                    subset_targets, next_inputs, il_next_actions, next_actions
+                                )
                         target_values = (
                             rews + self.cfg.discount_factor * (terminated | truncated).logical_not() * target_q_values
                         )
@@ -705,4 +802,6 @@ class RLPD(Agent):
                         f"{prefix}Data / Offline ratio",
                         float(offline_count) / float(total_samples),
                     )
-
+                if self._should_use_proposals():
+                    self.track_data(f"{prefix}Proposal / Actor IL fraction", float(self._actor_il_fraction))
+                    self.track_data(f"{prefix}Proposal / Bootstrap IL weight", float(self._bootstrap_il_fraction))

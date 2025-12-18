@@ -33,6 +33,8 @@ WANDB_CONFIG_KEYS = (
     "initial_entropy_value",
     "random_timesteps",
     "learning_starts",
+    "enable_proposal",
+    "proposal_beta",
 )
 
 
@@ -86,6 +88,10 @@ parser.add_argument(
     default=HQ_TRAJECTORY_TARGET,
     help="Number of HQ trajectories to collect before raising the threshold during training (set 0 to disable)",
 )
+# feature of actor proposal & bootstrap proposal 
+parser.add_argument("--enable_proposal", action="store_true", help="Enable IBRL actor/bootstrap proposals")
+parser.add_argument("--il_policy_checkpoint", type=str, default=None, help="Checkpoint for IL policy used in proposals")
+parser.add_argument("--proposal_beta", type=float, default=10.0, help="Inverse temperature for proposal softmax")
 # rollout mode relavent
 parser.add_argument("--rollout_dataset", type=str, default=None, help="Save collected transitions to this .pt file (forces eval mode)")
 # wandb relavent
@@ -141,6 +147,7 @@ from o2o_rl.utils.high_quality import (
 )
 from o2o_rl.utils.shared_autonomy import SharedAutonomyController
 from o2o_rl.utils.allegro_zmq import ZMQCommandListener, ExternalActionProcessor
+from o2o_rl.utils.il_policy import load_il_policy
 
 # wrap the environment
 env = wrap_env(env)
@@ -242,6 +249,26 @@ if args.offline_dataset:
     offline_dataset = _create_offline_dataset()
     offline_dataset.load(args.offline_dataset)
 
+il_policy = None
+if args.enable_proposal:
+    if not args.il_policy_checkpoint:
+        logger.error("--enable_proposal requires --il_policy_checkpoint")
+        exit(1)
+    if not os.path.exists(args.il_policy_checkpoint):
+        logger.error(f"IL policy checkpoint not found: '{args.il_policy_checkpoint}'")
+        exit(1)
+    il_policy = load_il_policy(
+        observation_space,
+        state_space,
+        action_space,
+        device,
+        args.il_policy_checkpoint,
+        hidden_dims=(512, 256, 128),
+        activation=nn.ELU,
+        log_std_bounds=(-20.0, 2.0),
+    )
+    logger.info("Loaded IL policy from %s", args.il_policy_checkpoint)
+
 date_prefix = datetime.now().strftime("%Y%m%d")
 run_name_suffix = args.wandb_run_name or ""
 wandb_run_name = (
@@ -266,6 +293,8 @@ cfg.num_min_qs = args.num_min_qs
 cfg.utd_ratio = args.utd_ratio
 cfg.env_steps_per_update = args.steps_per_update
 cfg.offline_ratio = args.offline_ratio
+cfg.enable_proposal = bool(args.enable_proposal)
+cfg.proposal_softmax_beta = float(args.proposal_beta)
 
 cfg.state_preprocessor = RunningStandardScaler
 cfg.state_preprocessor_kwargs = {"size": observation_space, "device": device}
@@ -285,6 +314,7 @@ agent = RLPD(
     action_space=action_space,
     device=device,
     offline_dataset=offline_dataset,
+    il_policy=il_policy,
 )
 
 tags = args.wandb_tags or None

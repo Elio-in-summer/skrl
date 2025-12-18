@@ -143,6 +143,12 @@ class RLPD_CFG(AgentCfg):
     offline_mix_mode: str = "shuffle"
     """Strategy to merge offline and online samples. Options: ``shuffle`` (default), ``interleave``, ``sequential``."""
 
+    enable_proposal: bool = False
+    """Enable IBRL-style actor/bootstrap proposals using an IL policy."""
+
+    proposal_softmax_beta: float = 1.0
+    """Inverse temperature for the softmax used when mixing IL/RL proposals."""
+
     def expand(self) -> None:
         """Expand the configuration (mirrors SAC_CFG.expand)."""
         super().expand()
@@ -185,3 +191,5 @@ class RLPD_CFG(AgentCfg):
             raise ValueError(
                 f"offline_mix_mode must be one of {allowed_mix_modes}, got '{self.offline_mix_mode}'"
             )
+        if self.proposal_softmax_beta < 0:
+            raise ValueError("proposal_softmax_beta must be >= 0")
