@@ -28,6 +28,11 @@ WANDB_CONFIG_KEYS = (
     "hq_traj_enable",
     "hq_traj_threshold",
     "hq_traj_increment_every",
+    "discount_factor",
+    "polyak",
+    "initial_entropy_value",
+    "random_timesteps",
+    "learning_starts",
 )
 
 
@@ -99,6 +104,13 @@ parser.add_argument(
 )
 # if human intervention is enabled, match simulation speed to wall-clock time during eval/rollout
 parser.add_argument("--real_time", action="store_true", help="Match simulation speed to wall-clock time during eval/rollout")
+# training parameters which not so important yet, usually not changed
+parser.add_argument("--discount_factor", type=float, default=0.97, help="Discount factor for the RL agent")
+parser.add_argument("--polyak", type=float, default=0.005, help="Polyak factor for the RL agent")
+parser.add_argument("--initial_entropy_value", type=float, default=1, help="Initial entropy value for the RL agent")
+parser.add_argument("--random_timesteps", type=int, default=1000, help="Number of random timesteps to collect before training")
+parser.add_argument("--learning_starts", type=int, default=1000, help="Number of learning starts for the RL agent")
+
 
 # load the environment FIRST so that SimulationApp initializes and resolves
 # runtime libraries before importing torch/skrl heavy modules.
@@ -133,6 +145,7 @@ from o2o_rl.utils.allegro_zmq import ZMQCommandListener, ExternalActionProcessor
 # wrap the environment
 env = wrap_env(env)
 
+
 # Normalize action space to [-1, 1] before exposing it to the agent
 act_shape = env.action_space.shape
 bounded_space = gym.spaces.Box(
@@ -165,9 +178,9 @@ if args.real_time and not run_eval:
 # seed for reproducibility
 set_seed(args.seed)  # e.g. `set_seed(42)` for fixed seed
 
-# if args.offline_ratio > 0.0 and not args.offline_dataset:
-#     logger.error("--offline_ratio > 0 requires --offline_dataset")
-#     exit(1)
+if args.offline_ratio > 0.0 and not args.offline_dataset and not run_eval:
+    logger.error("--offline_ratio > 0 requires --offline_dataset")
+    exit(1)
 
 
 # instantiate a replay memory
@@ -239,13 +252,13 @@ wandb_run_name = (
 cfg = RLPD_CFG()
 cfg.gradient_steps = args.gradient_steps
 cfg.batch_size = args.batch_size
-cfg.discount_factor = 0.97
-cfg.polyak = 0.005
+cfg.discount_factor = args.discount_factor
+cfg.polyak = args.polyak
 cfg.learning_rate = args.learning_rate
-cfg.random_timesteps = 1000  # better early coverage; can be overridden below
-cfg.learning_starts = 1000
+cfg.random_timesteps = args.random_timesteps if not run_eval else 0
+cfg.learning_starts = args.learning_starts if not run_eval else 0
 cfg.learn_entropy = True
-cfg.initial_entropy_value = 1
+cfg.initial_entropy_value = args.initial_entropy_value
 cfg.critic_layer_norm = args.critic_layer_norm
 cfg.layer_norm_affine = args.ln_affine
 cfg.num_qs = args.num_qs
