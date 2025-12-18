@@ -67,7 +67,7 @@ tests = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["skrl"]
+include = ["skrl*", "o2o_rl*"]
 
 
 [tool.black]
