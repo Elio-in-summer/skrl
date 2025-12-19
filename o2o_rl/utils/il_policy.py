@@ -30,11 +30,13 @@ def load_il_policy(
     policy.eval()
     state = torch.load(checkpoint_path, map_location=device)
     if isinstance(state, dict):
-        if "state_dict" in state:
+        if "policy" in state:  # RLPD agent checkpoint format
+            state = state["policy"]
+        elif "state_dict" in state:
             state = state["state_dict"]
         elif "model_state_dict" in state:
             state = state["model_state_dict"]
-    policy.load_state_dict(state, strict=False)
+    policy.load_state_dict(state, strict=True)  # strict=True to catch loading errors
     for param in policy.parameters():
         param.requires_grad_(False)
     return policy
