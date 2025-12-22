@@ -94,6 +94,12 @@ parser.add_argument("--il_policy_checkpoint", type=str, default=None, help="Chec
 parser.add_argument("--proposal_beta", type=float, default=10.0, help="Inverse temperature for proposal softmax")
 # rollout mode relavent
 parser.add_argument("--rollout_dataset", type=str, default=None, help="Save collected transitions to this .pt file (forces eval mode)")
+# preload offline data to online buffer
+parser.add_argument(
+    "--preload_to_online",
+    action="store_true",
+    help="Preload offline dataset into online replay buffer at training start",
+)
 # wandb relavent
 parser.add_argument(
     "--wandb_run_name",
@@ -403,6 +409,23 @@ if run_eval and trainer_cls is SharedAutonomySequentialTrainer:
         step_dt = getattr(getattr(env, "unwrapped", None), "step_dt", None)
     trainer_kwargs["real_time_dt"] = step_dt
 trainer = trainer_cls(cfg=cfg_trainer, env=env, agents=agent, **trainer_kwargs)
+
+# Preload offline data into online replay buffer if requested
+if args.offline_dataset and args.preload_to_online and not run_eval:
+    # Manually initialize agent to create memory tensors before preloading
+    agent.init(trainer_cfg=None)
+    preload_data = torch.load(args.offline_dataset, map_location="cpu")
+    loaded = memory.preload_flat_data(preload_data)
+    dropped = preload_data["rewards"].shape[0] - loaded
+    logger.info(
+        f"Preloaded {loaded} offline transitions into online replay buffer "
+        f"(dropped {dropped} samples to align with num_envs={env.num_envs})"
+    )
+    if args.offline_ratio > 0:
+        logger.warning(
+            "Both --preload_to_online and --offline_ratio > 0 are set. "
+            "The offline data will be both preloaded AND sampled separately."
+        )
 
 if args.checkpoint:
     if not os.path.exists(args.checkpoint):

@@ -414,3 +414,59 @@ class Memory(ABC):
         # unsupported format
         else:
             raise ValueError(f"File at path '{path}' has an unsupported format")
+
+    def preload_flat_data(self, data: dict[str, torch.Tensor]) -> int:
+        """Preload flat (2D) dataset into memory for warm-starting.
+
+        This method loads pre-collected transitions (e.g., from offline datasets)
+        directly into the replay buffer. The data is expected in flat format
+        with shape (num_samples, data_size).
+
+        Only complete rows (divisible by num_envs) are loaded. Any remainder
+        samples are discarded to ensure consistent memory index state.
+
+        :param data: Dict of tensors with shape (N, data_size).
+        :return: Number of samples actually loaded (always divisible by num_envs).
+        """
+        if not data:
+            return 0
+
+        # Determine sample count from first available tensor
+        sample_tensor = next((v for v in data.values() if v is not None), None)
+        if sample_tensor is None:
+            return 0
+        num_samples = sample_tensor.shape[0]
+
+        # Calculate capacity and truncate to complete rows only
+        max_capacity = self.memory_size * self.num_envs
+        # Truncate to be divisible by num_envs (drop partial row)
+        num_samples_truncated = (num_samples // self.num_envs) * self.num_envs
+        samples_to_load = min(num_samples_truncated, max_capacity)
+
+        if samples_to_load == 0:
+            return 0
+
+        # Copy data into tensors_view (which is the flat view of 3D tensors)
+        for name, tensor in data.items():
+            if name not in self.tensors or tensor is None:
+                continue
+            target_view = self.tensors_view[name]
+            source = tensor[:samples_to_load].to(device=self.device)
+            target_view[:samples_to_load].copy_(source)
+
+        # Update memory state indexes
+        # Since we only load complete rows, env_index is always 0
+        num_rows = samples_to_load // self.num_envs
+
+        if samples_to_load >= max_capacity:
+            # Buffer is full, next write wraps to beginning
+            self.filled = True
+            self.memory_index = 0
+        else:
+            self.memory_index = num_rows
+            self.filled = False
+
+        # env_index is always 0 since we only load complete rows
+        self.env_index = 0
+
+        return samples_to_load

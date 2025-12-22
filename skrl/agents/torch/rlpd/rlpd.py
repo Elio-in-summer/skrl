@@ -506,6 +506,7 @@ class RLPD(Agent):
         with torch.no_grad():
             il_actions = self._compute_il_actions(inputs)
             if il_actions is None:
+                logger.warning("IL actions are None, using RL actions instead")
                 return rl_actions
             subset_targets = self._select_target_subset()
             q_rl = self._compute_target_q_min(subset_targets, inputs, rl_actions)
